@@ -1,0 +1,31 @@
+# MouseLogi config
+# Lines use: mouse_button = shortcut
+#
+# Mouse buttons:
+#   XButton1      rear side button / Back button
+#   XButton2      front side button / Forward button
+#   MButton       middle button
+#   WheelLeft     horizontal wheel left
+#   WheelRight    horizontal wheel right
+#   WheelUp       vertical wheel up
+#   WheelDown     vertical wheel down
+#   CID0053       Logitech HID++ control id 0x0053
+#   CID0056       Logitech HID++ control id 0x0056
+#   CID00C3       Logitech HID++ control id 0x00C3
+#
+# Shortcuts:
+#   Ctrl+C
+#   Ctrl+Shift+P
+#   Alt+Left
+#   Alt+Right
+#   Win+Shift+S
+
+XButton1 = Alt+Left
+XButton2 = Alt+Right
+
+# MButton = Ctrl+W
+# WheelLeft = Ctrl+PageUp
+# WheelRight = Ctrl+PageDown
+# CID0053 = Alt+Left
+# CID0056 = Alt+Right
+# CID00C3 = Win+Shift+S

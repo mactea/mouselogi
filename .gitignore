@@ -1,0 +1,19 @@
+# Build outputs
+bin/
+obj/
+*.obj
+*.exe
+*.pdb
+*.ilk
+
+# Local runtime config
+config.ini
+
+# Visual Studio / editor noise
+.vs/
+*.user
+*.suo
+
+# OS noise
+Thumbs.db
+Desktop.ini
