@@ -18,6 +18,8 @@
 #   Ctrl+Shift+P
 #   Alt+Left
 #   Alt+Right
+#   RightAlt
+#   RightAlt+E
 #   Win+Shift+S
 
 XButton1 = Alt+Left

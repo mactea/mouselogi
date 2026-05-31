@@ -25,9 +25,15 @@
 .\bin\native\MouseLogiNative.exe --quit
 ```
 
+重启：
+
+```powershell
+.\bin\native\MouseLogiNative.exe --reset
+```
+
 启用 `CIDxxxx` 映射时不要优先用 `Stop-Process -Force`，因为它会跳过恢复 HID++ divert 的清理逻辑。若误强制结束后按钮行为异常，关闭鼠标再打开即可恢复。
 
-配置文件在 `.\bin\native\config.ini`。修改配置后重启进程生效。
+配置文件在 `.\bin\native\config.ini`。修改配置后用 `--reset` 重启进程生效。
 
 Logitech HID++ 特殊按钮也可以直接用 CID 配置。只有配置里出现 `CIDxxxx` 时，程序才会启用 HID++ divert：
 
@@ -128,6 +134,8 @@ WheelRight = Ctrl+PageDown
 - `Ctrl+Shift+P`
 - `Alt+Left`
 - `Alt+Right`
+- `RightAlt`
+- `RightAlt+E`
 - `Win+Shift+S`
 
 ## 限制

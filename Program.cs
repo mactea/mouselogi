@@ -168,7 +168,8 @@ namespace MouseLogi
 #   Ctrl+C
 #   Ctrl+Shift+P
 #   Alt+Left
-#   Alt+Right
+#   RightAlt
+#   RightAlt+E
 #   Win+Shift+S
 
 XButton1 = Alt+Left
@@ -474,6 +475,8 @@ XButton2 = Alt+Right
         private const ushort VK_CONTROL = 0x11;
         private const ushort VK_SHIFT = 0x10;
         private const ushort VK_MENU = 0x12;
+        private const ushort VK_LMENU = 0xA4;
+        private const ushort VK_RMENU = 0xA5;
         private const ushort VK_LWIN = 0x5B;
 
         private static readonly Dictionary<string, ushort> NamedKeys = BuildNamedKeys();
@@ -518,9 +521,9 @@ XButton2 = Alt+Right
                 }
             }
 
-            if (keys.Count == 0)
+            if (modifiers.Count == 0 && keys.Count == 0)
             {
-                error = "shortcut has no non-modifier key.";
+                error = "empty shortcut.";
                 return false;
             }
 
@@ -542,6 +545,15 @@ XButton2 = Alt+Right
                 case "ALT":
                 case "MENU":
                     keyCode = VK_MENU;
+                    return true;
+                case "RIGHTALT":
+                case "RALT":
+                case "ALTGR":
+                    keyCode = VK_RMENU;
+                    return true;
+                case "LEFTALT":
+                case "LALT":
+                    keyCode = VK_LMENU;
                     return true;
                 case "WIN":
                 case "WINDOWS":
@@ -705,6 +717,9 @@ XButton2 = Alt+Right
                 case 0x2D: // Insert
                 case 0x2E: // Delete
                 case 0x5B: // Left Win
+                case 0x5C: // Right Win
+                case 0xA3: // Right Control
+                case 0xA5: // Right Alt
                     return true;
                 default:
                     return false;

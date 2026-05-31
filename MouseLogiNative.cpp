@@ -1,6 +1,7 @@
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
 #include <setupapi.h>
+#include <shellapi.h>
 #include <hidsdi.h>
 #include <hidpi.h>
 
@@ -37,7 +38,9 @@ namespace
     HHOOK g_hook = NULL;
     Shortcut g_shortcuts[TriggerCount];
     std::map<USHORT, Shortcut> g_hidppShortcuts;
+    const wchar_t kSingleInstanceMutexName[] = L"Local\\MouseLogiNative.SingleInstance";
     const wchar_t kQuitEventName[] = L"Local\\MouseLogiNative.QuitEvent";
+    const DWORD kResetWaitMs = 10000;
 
     struct HidDevice
     {
@@ -71,7 +74,7 @@ namespace
         "#\r\n"
         "# Buttons: XButton1, XButton2, MButton, WheelLeft, WheelRight, WheelUp, WheelDown\r\n"
         "# Logitech HID++ buttons: CID0053, CID0056, CID00C3, or aliases LogiBack, LogiForward, LogiGesture\r\n"
-        "# Shortcuts: Ctrl+C, Ctrl+Shift+P, Alt+Left, Alt+Right, Win+Shift+S\r\n"
+        "# Shortcuts: Ctrl+C, Ctrl+Shift+P, Alt+Left, RightAlt, RightAlt+E, Win+Shift+S\r\n"
         "\r\n"
         "XButton1 = Alt+Left\r\n"
         "XButton2 = Alt+Right\r\n"
@@ -79,6 +82,42 @@ namespace
         "# MButton = Ctrl+W\r\n"
         "# WheelLeft = Ctrl+PageUp\r\n"
         "# WheelRight = Ctrl+PageDown\r\n";
+
+    bool HasCommandLineArgument(const wchar_t* expected)
+    {
+        int argc = 0;
+        LPWSTR* argv = CommandLineToArgvW(GetCommandLineW(), &argc);
+        if (argv == NULL)
+        {
+            return false;
+        }
+
+        bool found = false;
+        for (int i = 1; i < argc; ++i)
+        {
+            if (lstrcmpiW(argv[i], expected) == 0)
+            {
+                found = true;
+                break;
+            }
+        }
+
+        LocalFree(argv);
+        return found;
+    }
+
+    bool SignalQuitEvent()
+    {
+        HANDLE quitEvent = OpenEventW(EVENT_MODIFY_STATE, FALSE, kQuitEventName);
+        if (quitEvent == NULL)
+        {
+            return false;
+        }
+
+        BOOL signaled = SetEvent(quitEvent);
+        CloseHandle(quitEvent);
+        return signaled != FALSE;
+    }
 
     std::string Trim(const std::string& value)
     {
@@ -255,6 +294,16 @@ namespace
             *key = VK_MENU;
             return true;
         }
+        if (token == "RIGHTALT" || token == "RALT" || token == "ALTGR")
+        {
+            *key = VK_RMENU;
+            return true;
+        }
+        if (token == "LEFTALT" || token == "LALT")
+        {
+            *key = VK_LMENU;
+            return true;
+        }
         if (token == "WIN" || token == "WINDOWS" || token == "CMD" || token == "COMMAND")
         {
             *key = VK_LWIN;
@@ -390,7 +439,7 @@ namespace
             return false;
         }
 
-        if (parsed.keys.empty())
+        if (parsed.modifiers.empty() && parsed.keys.empty())
         {
             return false;
         }
@@ -556,6 +605,9 @@ namespace
             case VK_INSERT:
             case VK_DELETE:
             case VK_LWIN:
+            case VK_RWIN:
+            case VK_RMENU:
+            case VK_RCONTROL:
                 return true;
             default:
                 return false;
@@ -1135,26 +1187,39 @@ namespace
 
 int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int)
 {
-    if (std::wcsstr(GetCommandLineW(), L"--quit") != NULL)
+    bool quitRequested = HasCommandLineArgument(L"--quit") || HasCommandLineArgument(L"quit");
+    bool resetRequested = HasCommandLineArgument(L"--reset") || HasCommandLineArgument(L"reset");
+
+    if (quitRequested)
     {
-        HANDLE quitEvent = OpenEventW(EVENT_MODIFY_STATE, FALSE, kQuitEventName);
-        if (quitEvent != NULL)
-        {
-            SetEvent(quitEvent);
-            CloseHandle(quitEvent);
-        }
+        SignalQuitEvent();
         return 0;
     }
 
-    HANDLE mutex = CreateMutexW(NULL, TRUE, L"Local\\MouseLogiNative.SingleInstance");
+    if (resetRequested)
+    {
+        SignalQuitEvent();
+    }
+
+    HANDLE mutex = CreateMutexW(NULL, TRUE, kSingleInstanceMutexName);
     if (mutex == NULL)
     {
         return 1;
     }
     if (GetLastError() == ERROR_ALREADY_EXISTS)
     {
-        CloseHandle(mutex);
-        return 0;
+        if (!resetRequested)
+        {
+            CloseHandle(mutex);
+            return 0;
+        }
+
+        DWORD waitResult = WaitForSingleObject(mutex, kResetWaitMs);
+        if (waitResult != WAIT_OBJECT_0 && waitResult != WAIT_ABANDONED)
+        {
+            CloseHandle(mutex);
+            return 1;
+        }
     }
 
     std::wstring configPath = GetExeDirectory() + L"\\config.ini";
