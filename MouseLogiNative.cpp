@@ -45,6 +45,7 @@ namespace
     struct HidDevice
     {
         std::wstring path;
+        std::string deviceId;
         USHORT vendorId = 0;
         USHORT productId = 0;
         USAGE usagePage = 0;
@@ -64,6 +65,7 @@ namespace
     HANDLE g_hidppStopEvent = NULL;
     HidDevice g_hidppDevice;
     HidppBasics g_hidppBasics;
+    std::string g_activeMouseId;
     std::vector<USHORT> g_divertedCids;
     std::thread g_hidppThread;
     std::atomic<bool> g_hidppStop(false);
@@ -75,6 +77,8 @@ namespace
         "# Buttons: XButton1, XButton2, MButton, WheelLeft, WheelRight, WheelUp, WheelDown\r\n"
         "# Logitech HID++ buttons: CID0053, CID0056, CID00C3, or aliases LogiBack, LogiForward, LogiGesture\r\n"
         "# Shortcuts: Ctrl+C, Ctrl+Shift+P, Alt+Left, RightAlt, RightAlt+E, Win+Shift+S\r\n"
+        "# Device blocks are optional and use the Bluetooth device address from MouseLogiHidProbe.exe --list.\r\n"
+        "# Example: [mouse:C7284491160D]\r\n"
         "\r\n"
         "XButton1 = Alt+Left\r\n"
         "XButton2 = Alt+Right\r\n"
@@ -134,6 +138,159 @@ namespace
         }
 
         return value.substr(start, end - start);
+    }
+
+    std::string NormalizeSectionName(const std::string& value)
+    {
+        std::string result;
+        for (size_t i = 0; i < value.size(); ++i)
+        {
+            unsigned char ch = static_cast<unsigned char>(value[i]);
+            if (std::isspace(ch) != 0 || ch == '-' || ch == '_')
+            {
+                continue;
+            }
+            result.push_back(static_cast<char>(std::toupper(ch)));
+        }
+        return result;
+    }
+
+    std::string NormalizeDeviceId(const std::string& value)
+    {
+        std::string upperValue(value);
+        for (size_t i = 0; i < upperValue.size(); ++i)
+        {
+            upperValue[i] = static_cast<char>(std::toupper(static_cast<unsigned char>(upperValue[i])));
+        }
+
+        size_t devIndex = upperValue.find("DEV");
+        if (devIndex != std::string::npos)
+        {
+            std::string fromDev;
+            for (size_t i = devIndex + 3; i < upperValue.size(); ++i)
+            {
+                unsigned char ch = static_cast<unsigned char>(upperValue[i]);
+                if (std::isxdigit(ch) != 0)
+                {
+                    fromDev.push_back(static_cast<char>(ch));
+                    if (fromDev.size() == 12)
+                    {
+                        return fromDev;
+                    }
+                }
+                else if (!fromDev.empty())
+                {
+                    fromDev.clear();
+                }
+            }
+        }
+
+        std::string result;
+        for (size_t i = 0; i < upperValue.size(); ++i)
+        {
+            unsigned char ch = static_cast<unsigned char>(upperValue[i]);
+            if (std::isxdigit(ch) == 0)
+            {
+                continue;
+            }
+            result.push_back(static_cast<char>(ch));
+        }
+
+        if (result.size() > 12)
+        {
+            result = result.substr(result.size() - 12);
+        }
+        return result;
+    }
+
+    bool IsGlobalSectionName(const std::string& name)
+    {
+        std::string normalized = NormalizeSectionName(name);
+        return normalized == "GLOBAL" || normalized == "DEFAULT" || normalized == "ALL";
+    }
+
+    bool TryParseDeviceSectionId(const std::string& sectionName, std::string* deviceId)
+    {
+        std::string name = Trim(sectionName);
+        if (name.empty() || IsGlobalSectionName(name))
+        {
+            return false;
+        }
+
+        std::string target = name;
+        size_t separator = name.find_first_of(":=");
+        if (separator != std::string::npos)
+        {
+            std::string prefix = NormalizeSectionName(name.substr(0, separator));
+            if (prefix == "MOUSE" || prefix == "DEVICE" || prefix == "ID")
+            {
+                target = name.substr(separator + 1);
+            }
+        }
+        else
+        {
+            size_t firstSpace = name.find_first_of(" \t");
+            if (firstSpace != std::string::npos)
+            {
+                std::string prefix = NormalizeSectionName(name.substr(0, firstSpace));
+                if (prefix == "MOUSE" || prefix == "DEVICE" || prefix == "ID")
+                {
+                    target = name.substr(firstSpace + 1);
+                }
+            }
+        }
+
+        std::string normalized = NormalizeDeviceId(target);
+        if (normalized.size() < 6)
+        {
+            return false;
+        }
+
+        *deviceId = normalized;
+        return true;
+    }
+
+    void AddUniqueString(std::vector<std::string>* values, const std::string& value)
+    {
+        if (std::find(values->begin(), values->end(), value) == values->end())
+        {
+            values->push_back(value);
+        }
+    }
+
+    void StripUtf8Bom(std::string* content)
+    {
+        if (content->size() >= 3 &&
+            static_cast<unsigned char>((*content)[0]) == 0xEF &&
+            static_cast<unsigned char>((*content)[1]) == 0xBB &&
+            static_cast<unsigned char>((*content)[2]) == 0xBF)
+        {
+            content->erase(0, 3);
+        }
+    }
+
+    bool TryParseSectionHeader(const std::string& line, std::string* sectionName)
+    {
+        if (line.size() < 2 || line[0] != '[' || line[line.size() - 1] != ']')
+        {
+            return false;
+        }
+
+        *sectionName = Trim(line.substr(1, line.size() - 2));
+        return true;
+    }
+
+    bool SectionApplies(const std::string& sectionName, const std::string& activeMouseId)
+    {
+        if (IsGlobalSectionName(sectionName))
+        {
+            return true;
+        }
+
+        std::string sectionDeviceId;
+        return !activeMouseId.empty() &&
+            TryParseDeviceSectionId(sectionName, &sectionDeviceId) &&
+            sectionDeviceId == activeMouseId;
     }
 
     std::string NormalizeToken(const std::string& value)
@@ -499,49 +656,8 @@ namespace
         return true;
     }
 
-    void EnsureDefaultConfig(const std::wstring& path)
+    void ExtractConfiguredDeviceIds(const std::string& content, std::vector<std::string>* deviceIds)
     {
-        DWORD attributes = GetFileAttributesW(path.c_str());
-        if (attributes != INVALID_FILE_ATTRIBUTES)
-        {
-            return;
-        }
-
-        HANDLE file = CreateFileW(path.c_str(), GENERIC_WRITE, 0, NULL, CREATE_NEW, FILE_ATTRIBUTE_NORMAL, NULL);
-        if (file == INVALID_HANDLE_VALUE)
-        {
-            return;
-        }
-
-        DWORD written = 0;
-        WriteFile(file, kDefaultConfig, static_cast<DWORD>(sizeof(kDefaultConfig) - 1), &written, NULL);
-        CloseHandle(file);
-    }
-
-    void LoadConfig(const std::wstring& path)
-    {
-        for (int i = 0; i < TriggerCount; ++i)
-        {
-            g_shortcuts[i] = Shortcut();
-        }
-        g_hidppShortcuts.clear();
-
-        EnsureDefaultConfig(path);
-
-        std::string content;
-        if (!ReadWholeFile(path, &content))
-        {
-            return;
-        }
-
-        if (content.size() >= 3 &&
-            static_cast<unsigned char>(content[0]) == 0xEF &&
-            static_cast<unsigned char>(content[1]) == 0xBB &&
-            static_cast<unsigned char>(content[2]) == 0xBF)
-        {
-            content.erase(0, 3);
-        }
-
         size_t start = 0;
         while (start <= content.size())
         {
@@ -563,7 +679,88 @@ namespace
             }
 
             line = Trim(line);
+            std::string sectionName;
+            std::string deviceId;
+            if (TryParseSectionHeader(line, &sectionName) &&
+                TryParseDeviceSectionId(sectionName, &deviceId))
+            {
+                AddUniqueString(deviceIds, deviceId);
+            }
+        }
+    }
+
+    void EnsureDefaultConfig(const std::wstring& path)
+    {
+        DWORD attributes = GetFileAttributesW(path.c_str());
+        if (attributes != INVALID_FILE_ATTRIBUTES)
+        {
+            return;
+        }
+
+        HANDLE file = CreateFileW(path.c_str(), GENERIC_WRITE, 0, NULL, CREATE_NEW, FILE_ATTRIBUTE_NORMAL, NULL);
+        if (file == INVALID_HANDLE_VALUE)
+        {
+            return;
+        }
+
+        DWORD written = 0;
+        WriteFile(file, kDefaultConfig, static_cast<DWORD>(sizeof(kDefaultConfig) - 1), &written, NULL);
+        CloseHandle(file);
+    }
+
+    void LoadConfig(const std::wstring& path, const std::string& activeMouseId)
+    {
+        for (int i = 0; i < TriggerCount; ++i)
+        {
+            g_shortcuts[i] = Shortcut();
+        }
+        g_hidppShortcuts.clear();
+
+        EnsureDefaultConfig(path);
+
+        std::string content;
+        if (!ReadWholeFile(path, &content))
+        {
+            return;
+        }
+
+        StripUtf8Bom(&content);
+
+        size_t start = 0;
+        bool activeSection = true;
+        while (start <= content.size())
+        {
+            size_t end = content.find_first_of("\r\n", start);
+            std::string line;
+            if (end == std::string::npos)
+            {
+                line = content.substr(start);
+                start = content.size() + 1;
+            }
+            else
+            {
+                line = content.substr(start, end - start);
+                start = end + 1;
+                while (start < content.size() && (content[start] == '\r' || content[start] == '\n'))
+                {
+                    ++start;
+                }
+            }
+
+            line = Trim(line);
             if (line.empty() || line[0] == '#' || line[0] == ';')
+            {
+                continue;
+            }
+
+            std::string sectionName;
+            if (TryParseSectionHeader(line, &sectionName))
+            {
+                activeSection = SectionApplies(sectionName, activeMouseId);
+                continue;
+            }
+
+            if (!activeSection)
             {
                 continue;
             }
@@ -651,6 +848,65 @@ namespace
         }
     }
 
+    std::string NarrowAscii(const std::wstring& value)
+    {
+        std::string result;
+        for (size_t i = 0; i < value.size(); ++i)
+        {
+            wchar_t ch = value[i];
+            if (ch <= 0x7F)
+            {
+                result.push_back(static_cast<char>(ch));
+            }
+        }
+        return result;
+    }
+
+    std::wstring ToLowerAscii(const std::wstring& value)
+    {
+        std::wstring result(value);
+        for (size_t i = 0; i < result.size(); ++i)
+        {
+            if (result[i] >= L'A' && result[i] <= L'Z')
+            {
+                result[i] = static_cast<wchar_t>(result[i] - L'A' + L'a');
+            }
+        }
+        return result;
+    }
+
+    std::string ExtractDeviceIdFromPath(const std::wstring& path)
+    {
+        std::wstring lower = ToLowerAscii(path);
+        size_t marker = lower.find(L"_dev_vid&");
+        if (marker == std::wstring::npos)
+        {
+            return std::string();
+        }
+
+        size_t rev = lower.find(L"_rev&", marker);
+        if (rev == std::wstring::npos)
+        {
+            return std::string();
+        }
+
+        size_t idStart = lower.find(L"_", rev + 5);
+        if (idStart == std::wstring::npos || idStart + 1 >= lower.size())
+        {
+            return std::string();
+        }
+        ++idStart;
+
+        size_t idEnd = lower.find_first_of(L"&#\\", idStart);
+        std::wstring rawId = path.substr(idStart, idEnd == std::wstring::npos ? std::wstring::npos : idEnd - idStart);
+        std::string deviceId = NormalizeDeviceId(NarrowAscii(rawId));
+        if (deviceId.size() < 6)
+        {
+            return std::string();
+        }
+        return deviceId;
+    }
+
     bool FillHidDeviceInfo(const std::wstring& path, HidDevice* device)
     {
         HANDLE handle = CreateFileW(path.c_str(), 0, FILE_SHARE_READ | FILE_SHARE_WRITE, NULL, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
@@ -685,7 +941,7 @@ namespace
         return true;
     }
 
-    bool FindHidppDevice(HidDevice* foundDevice)
+    bool FindHidppDevices(std::vector<HidDevice>* devices)
     {
         GUID hidGuid = {};
         HidD_GetHidGuid(&hidGuid);
@@ -696,7 +952,6 @@ namespace
             return false;
         }
 
-        bool found = false;
         for (DWORD index = 0;; ++index)
         {
             SP_DEVICE_INTERFACE_DATA interfaceData = {};
@@ -738,14 +993,63 @@ namespace
                 device.inputReportLength >= 20 &&
                 device.outputReportLength >= 20)
             {
-                *foundDevice = device;
-                found = true;
-                break;
+                device.deviceId = ExtractDeviceIdFromPath(device.path);
+                devices->push_back(device);
             }
         }
 
         SetupDiDestroyDeviceInfoList(deviceInfoSet);
-        return found;
+        return !devices->empty();
+    }
+
+    bool FindHidppDevice(HidDevice* foundDevice)
+    {
+        std::vector<HidDevice> devices;
+        if (!FindHidppDevices(&devices))
+        {
+            return false;
+        }
+
+        *foundDevice = devices[0];
+        return true;
+    }
+
+    void SelectActiveHidppDevice(const std::wstring& configPath)
+    {
+        g_activeMouseId.clear();
+        g_hidppDevice = HidDevice();
+
+        EnsureDefaultConfig(configPath);
+
+        std::string content;
+        std::vector<std::string> configuredDeviceIds;
+        if (ReadWholeFile(configPath, &content))
+        {
+            StripUtf8Bom(&content);
+            ExtractConfiguredDeviceIds(content, &configuredDeviceIds);
+        }
+
+        std::vector<HidDevice> devices;
+        if (!FindHidppDevices(&devices))
+        {
+            return;
+        }
+
+        for (size_t idIndex = 0; idIndex < configuredDeviceIds.size(); ++idIndex)
+        {
+            for (size_t deviceIndex = 0; deviceIndex < devices.size(); ++deviceIndex)
+            {
+                if (devices[deviceIndex].deviceId == configuredDeviceIds[idIndex])
+                {
+                    g_hidppDevice = devices[deviceIndex];
+                    g_activeMouseId = devices[deviceIndex].deviceId;
+                    return;
+                }
+            }
+        }
+
+        g_hidppDevice = devices[0];
+        g_activeMouseId = devices[0].deviceId;
     }
 
     bool HidppWriteReport(const std::vector<BYTE>& report)
@@ -1029,7 +1333,7 @@ namespace
             return true;
         }
 
-        if (!FindHidppDevice(&g_hidppDevice))
+        if (g_hidppDevice.path.empty() && !FindHidppDevice(&g_hidppDevice))
         {
             return false;
         }
@@ -1223,7 +1527,8 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int)
     }
 
     std::wstring configPath = GetExeDirectory() + L"\\config.ini";
-    LoadConfig(configPath);
+    SelectActiveHidppDevice(configPath);
+    LoadConfig(configPath, g_activeMouseId);
 
     HANDLE quitEvent = CreateEventW(NULL, FALSE, FALSE, kQuitEventName);
     if (quitEvent == NULL)

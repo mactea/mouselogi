@@ -5,10 +5,16 @@
 #include <hidpi.h>
 #include <conio.h>
 
+#include <fcntl.h>
+#include <io.h>
+
+#include <algorithm>
 #include <atomic>
+#include <cctype>
 #include <cwchar>
 #include <iomanip>
 #include <iostream>
+#include <map>
 #include <mutex>
 #include <sstream>
 #include <string>
@@ -21,6 +27,8 @@ namespace
     {
         int index = 0;
         std::wstring path;
+        std::wstring deviceId;
+        std::wstring displayName;
         USHORT vendorId = 0;
         USHORT productId = 0;
         USHORT version = 0;
@@ -36,6 +44,9 @@ namespace
     std::mutex g_consoleMutex;
     HANDLE g_stopEvent = NULL;
     std::atomic<bool> g_stop(false);
+    std::wstring g_targetMouseId;
+    std::map<std::wstring, HidDevice> g_detectedDevicesById;
+    std::map<std::wstring, std::vector<USHORT> > g_detectedCidsById;
 
     std::wstring ToLower(std::wstring value)
     {
@@ -57,6 +68,60 @@ namespace
                lower.find(L"ven_046d") != std::wstring::npos;
     }
 
+    std::wstring NormalizeDeviceId(const std::wstring& value)
+    {
+        std::wstring result;
+        for (size_t i = 0; i < value.size(); ++i)
+        {
+            wchar_t ch = value[i];
+            if (ch >= L'0' && ch <= L'9')
+            {
+                result.push_back(ch);
+            }
+            else if (ch >= L'a' && ch <= L'f')
+            {
+                result.push_back(static_cast<wchar_t>(ch - L'a' + L'A'));
+            }
+            else if (ch >= L'A' && ch <= L'F')
+            {
+                result.push_back(ch);
+            }
+        }
+
+        if (result.size() > 12)
+        {
+            result = result.substr(result.size() - 12);
+        }
+        return result;
+    }
+
+    std::wstring ExtractDeviceIdFromPath(const std::wstring& path)
+    {
+        std::wstring lower = ToLower(path);
+        size_t marker = lower.find(L"_dev_vid&");
+        if (marker == std::wstring::npos)
+        {
+            return std::wstring();
+        }
+
+        size_t rev = lower.find(L"_rev&", marker);
+        if (rev == std::wstring::npos)
+        {
+            return std::wstring();
+        }
+
+        size_t idStart = lower.find(L"_", rev + 5);
+        if (idStart == std::wstring::npos || idStart + 1 >= lower.size())
+        {
+            return std::wstring();
+        }
+        ++idStart;
+
+        size_t idEnd = lower.find_first_of(L"&#\\", idStart);
+        std::wstring deviceId = NormalizeDeviceId(path.substr(idStart, idEnd == std::wstring::npos ? std::wstring::npos : idEnd - idStart));
+        return deviceId.size() >= 6 ? deviceId : std::wstring();
+    }
+
     std::wstring HexWord(USHORT value)
     {
         std::wstringstream stream;
@@ -71,6 +136,45 @@ namespace
         return stream.str();
     }
 
+    std::wstring KnownMouseName(USHORT productId)
+    {
+        switch (productId)
+        {
+            case 0xB023:
+                return L"MX Master 3";
+            case 0xB025:
+                return L"MX Anywhere 3";
+            case 0xB042:
+                return L"MX Master 4";
+            default:
+                if (productId != 0)
+                {
+                    return L"Logitech PID " + HexWord(productId);
+                }
+                return L"未知鼠标";
+        }
+    }
+
+    bool DeviceMatchesTarget(const HidDevice& device)
+    {
+        return g_targetMouseId.empty() || device.deviceId == g_targetMouseId;
+    }
+
+    void AddDetectedCid(const HidDevice& device, USHORT cid)
+    {
+        if (device.deviceId.empty() || cid == 0)
+        {
+            return;
+        }
+
+        g_detectedDevicesById[device.deviceId] = device;
+        std::vector<USHORT>& cids = g_detectedCidsById[device.deviceId];
+        if (std::find(cids.begin(), cids.end(), cid) == cids.end())
+        {
+            cids.push_back(cid);
+        }
+    }
+
     std::wstring LastErrorText(DWORD error)
     {
         switch (error)
@@ -78,21 +182,21 @@ namespace
             case 0:
                 return L"OK";
             case ERROR_ACCESS_DENIED:
-                return L"Access denied";
+                return L"访问被拒绝";
             case ERROR_SHARING_VIOLATION:
-                return L"Sharing violation";
+                return L"共享冲突";
             case ERROR_FILE_NOT_FOUND:
-                return L"File not found";
+                return L"找不到文件";
             case ERROR_INVALID_PARAMETER:
-                return L"Invalid parameter";
+                return L"参数无效";
             case ERROR_DEVICE_NOT_CONNECTED:
-                return L"Device not connected";
+                return L"设备未连接";
             case ERROR_OPERATION_ABORTED:
-                return L"Operation aborted";
+                return L"操作已中止";
             case ERROR_IO_PENDING:
-                return L"IO pending";
+                return L"IO 等待中";
             default:
-                return L"error " + std::to_wstring(error);
+                return L"错误 " + std::to_wstring(error);
         }
     }
 
@@ -152,6 +256,252 @@ namespace
     void ConsoleWriteLine()
     {
         ConsoleWrite(L"\r\n");
+    }
+
+    std::wstring GetExeDirectory()
+    {
+        wchar_t path[MAX_PATH] = {};
+        DWORD length = GetModuleFileNameW(NULL, path, MAX_PATH);
+        if (length == 0 || length == MAX_PATH)
+        {
+            return L".";
+        }
+
+        std::wstring dir(path, length);
+        size_t slash = dir.find_last_of(L"\\/");
+        if (slash == std::wstring::npos)
+        {
+            return L".";
+        }
+        return dir.substr(0, slash);
+    }
+
+    bool ReadTextFile(const std::wstring& path, std::string* content)
+    {
+        HANDLE file = CreateFileW(path.c_str(), GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE, NULL, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
+        if (file == INVALID_HANDLE_VALUE)
+        {
+            content->clear();
+            return false;
+        }
+
+        LARGE_INTEGER size = {};
+        if (!GetFileSizeEx(file, &size) || size.QuadPart < 0 || size.QuadPart > 1024 * 1024)
+        {
+            CloseHandle(file);
+            return false;
+        }
+
+        content->assign(static_cast<size_t>(size.QuadPart), '\0');
+        DWORD read = 0;
+        BOOL ok = TRUE;
+        if (!content->empty())
+        {
+            ok = ReadFile(file, &(*content)[0], static_cast<DWORD>(content->size()), &read, NULL);
+        }
+        CloseHandle(file);
+        if (!ok)
+        {
+            return false;
+        }
+        content->resize(read);
+        return true;
+    }
+
+    bool WriteTextFile(const std::wstring& path, const std::string& content)
+    {
+        HANDLE file = CreateFileW(path.c_str(), GENERIC_WRITE, 0, NULL, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
+        if (file == INVALID_HANDLE_VALUE)
+        {
+            return false;
+        }
+
+        DWORD written = 0;
+        BOOL ok = TRUE;
+        if (!content.empty())
+        {
+            ok = WriteFile(file, content.data(), static_cast<DWORD>(content.size()), &written, NULL);
+        }
+        CloseHandle(file);
+        return ok && written == content.size();
+    }
+
+    std::string NarrowAsciiString(const std::wstring& value)
+    {
+        std::string result;
+        for (size_t i = 0; i < value.size(); ++i)
+        {
+            wchar_t ch = value[i];
+            if (ch >= 0x20 && ch <= 0x7E)
+            {
+                result.push_back(static_cast<char>(ch));
+            }
+        }
+        return result;
+    }
+
+    std::string Utf8String(const std::wstring& value)
+    {
+        if (value.empty())
+        {
+            return std::string();
+        }
+
+        int size = WideCharToMultiByte(CP_UTF8, 0, value.c_str(), static_cast<int>(value.size()), NULL, 0, NULL, NULL);
+        if (size <= 0)
+        {
+            return NarrowAsciiString(value);
+        }
+
+        std::string result(static_cast<size_t>(size), '\0');
+        WideCharToMultiByte(CP_UTF8, 0, value.c_str(), static_cast<int>(value.size()), &result[0], size, NULL, NULL);
+        return result;
+    }
+
+    std::string TrimAscii(const std::string& value)
+    {
+        size_t start = 0;
+        while (start < value.size() && std::isspace(static_cast<unsigned char>(value[start])) != 0)
+        {
+            ++start;
+        }
+
+        size_t end = value.size();
+        while (end > start && std::isspace(static_cast<unsigned char>(value[end - 1])) != 0)
+        {
+            --end;
+        }
+        return value.substr(start, end - start);
+    }
+
+    std::string NormalizeDeviceIdAscii(const std::string& value)
+    {
+        std::wstring wide(value.begin(), value.end());
+        return NarrowAsciiString(NormalizeDeviceId(wide));
+    }
+
+    bool TryGetSectionDeviceId(const std::string& line, std::string* deviceId)
+    {
+        std::string trimmed = TrimAscii(line);
+        if (trimmed.size() < 2 || trimmed[0] != '[' || trimmed[trimmed.size() - 1] != ']')
+        {
+            return false;
+        }
+
+        std::string section = TrimAscii(trimmed.substr(1, trimmed.size() - 2));
+        size_t separator = section.find_first_of(":=");
+        std::string value = separator == std::string::npos ? section : section.substr(separator + 1);
+        std::string normalized = NormalizeDeviceIdAscii(value);
+        if (normalized.size() < 6)
+        {
+            return false;
+        }
+
+        *deviceId = normalized;
+        return true;
+    }
+
+    std::vector<std::string> SplitLines(const std::string& content)
+    {
+        std::vector<std::string> lines;
+        size_t start = 0;
+        while (start <= content.size())
+        {
+            size_t end = content.find_first_of("\r\n", start);
+            if (end == std::string::npos)
+            {
+                lines.push_back(content.substr(start));
+                break;
+            }
+
+            lines.push_back(content.substr(start, end - start));
+            start = end + 1;
+            while (start < content.size() && (content[start] == '\r' || content[start] == '\n'))
+            {
+                ++start;
+            }
+        }
+        return lines;
+    }
+
+    std::string JoinLines(const std::vector<std::string>& lines)
+    {
+        std::string content;
+        for (size_t i = 0; i < lines.size(); ++i)
+        {
+            content += lines[i];
+            content += "\r\n";
+        }
+        return content;
+    }
+
+    std::string CidName(USHORT cid)
+    {
+        std::stringstream stream;
+        stream << "CID" << std::uppercase << std::hex << std::setw(4) << std::setfill('0') << cid;
+        return stream.str();
+    }
+
+    void AppendLinesToMouseBlock(const HidDevice& device, const std::vector<std::string>& linesToAppend)
+    {
+        if (device.deviceId.empty() || linesToAppend.empty())
+        {
+            return;
+        }
+
+        std::wstring configPath = GetExeDirectory() + L"\\config.ini";
+        std::string content;
+        ReadTextFile(configPath, &content);
+        std::vector<std::string> lines = SplitLines(content);
+        std::string id = NarrowAsciiString(device.deviceId);
+        std::string name = Utf8String(device.displayName);
+
+        size_t blockStart = lines.size();
+        size_t blockEnd = lines.size();
+        for (size_t i = 0; i < lines.size(); ++i)
+        {
+            std::string sectionId;
+            if (TryGetSectionDeviceId(lines[i], &sectionId) && sectionId == id)
+            {
+                blockStart = i;
+                blockEnd = lines.size();
+                for (size_t j = i + 1; j < lines.size(); ++j)
+                {
+                    std::string trimmed = TrimAscii(lines[j]);
+                    if (trimmed.size() >= 2 && trimmed[0] == '[' && trimmed[trimmed.size() - 1] == ']')
+                    {
+                        blockEnd = j;
+                        break;
+                    }
+                }
+                break;
+            }
+        }
+
+        std::vector<std::string> insertLines;
+        insertLines.push_back("# MouseLogiHidProbe 检测到的 HID++ 控制项");
+        if (!name.empty())
+        {
+            insertLines.push_back("# 鼠标：" + name);
+        }
+        for (size_t i = 0; i < linesToAppend.size(); ++i)
+        {
+            insertLines.push_back(linesToAppend[i]);
+        }
+
+        if (blockStart == lines.size())
+        {
+            if (!lines.empty() && !TrimAscii(lines.back()).empty())
+            {
+                lines.push_back("");
+            }
+            lines.push_back("[mouse:" + id + "]");
+            blockEnd = lines.size();
+        }
+
+        lines.insert(lines.begin() + static_cast<std::ptrdiff_t>(blockEnd), insertLines.begin(), insertLines.end());
+        WriteTextFile(configPath, JoinLines(lines));
+        ConsoleWriteLine(L"已写入配置块：" + configPath + L" [mouse:" + device.deviceId + L"]");
     }
 
     bool TryOpenForInfo(const std::wstring& path, HANDLE* handle)
@@ -271,11 +621,13 @@ namespace
 
             HidDevice device;
             device.path = detail->DevicePath;
+            device.deviceId = ExtractDeviceIdFromPath(device.path);
 
             if (!FillDeviceInfo(device.path, &device))
             {
                 continue;
             }
+            device.displayName = KnownMouseName(device.productId);
 
             if (device.vendorId != 0x046D && !ContainsLogitechVid(device.path))
             {
@@ -295,10 +647,10 @@ namespace
     {
         std::lock_guard<std::mutex> lock(g_consoleMutex);
 
-        std::wcout << L"Logitech HID interfaces:" << std::endl;
+        std::wcout << L"Logitech HID 接口：" << std::endl;
         if (devices.empty())
         {
-            std::wcout << L"  none found" << std::endl;
+            std::wcout << L"  未找到" << std::endl;
             return;
         }
 
@@ -307,8 +659,16 @@ namespace
             const HidDevice& device = devices[i];
             std::wcout << L"  [" << device.index << L"] "
                        << L"VID=" << HexWord(device.vendorId)
-                       << L" PID=" << HexWord(device.productId)
-                       << L" ver=" << HexWord(device.version)
+                       << L" PID=" << HexWord(device.productId);
+            if (!device.displayName.empty())
+            {
+                std::wcout << L" name=\"" << device.displayName << L"\"";
+            }
+            if (!device.deviceId.empty())
+            {
+                std::wcout << L" deviceId=" << device.deviceId;
+            }
+            std::wcout << L" ver=" << HexWord(device.version)
                        << L" usagePage=" << HexWord(device.usagePage)
                        << L" usage=" << HexWord(device.usage)
                        << L" in=" << device.inputReportLength
@@ -317,11 +677,11 @@ namespace
 
             if (device.canOpenForRead)
             {
-                std::wcout << L" read=OK";
+                std::wcout << L" read=正常";
             }
             else
             {
-                std::wcout << L" read=NO(" << device.readOpenError << L": " << LastErrorText(device.readOpenError) << L")";
+                std::wcout << L" read=不可读(" << device.readOpenError << L": " << LastErrorText(device.readOpenError) << L")";
             }
             std::wcout << std::endl;
 
@@ -335,11 +695,16 @@ namespace
         std::wcout << Timestamp()
                    << L" HID [" << device.index << L"]"
                    << L" PID=" << HexWord(device.productId)
+                   << L" deviceId=" << device.deviceId
                    << L" page=" << HexWord(device.usagePage)
                    << L" usage=" << HexWord(device.usage)
-                   << L" len=" << bytesRead
-                   << L" data=" << BytesToHex(report.data(), bytesRead, 64)
+                   << L" 长度=" << bytesRead
+                   << L" 数据=" << BytesToHex(report.data(), bytesRead, 64)
                    << std::endl;
+        if (report.size() >= 6 && report[0] == 0x11)
+        {
+            AddDetectedCid(device, static_cast<USHORT>((report[4] << 8) | report[5]));
+        }
     }
 
     void PrintReadError(const HidDevice& device, DWORD error)
@@ -350,7 +715,7 @@ namespace
         }
 
         std::lock_guard<std::mutex> lock(g_consoleMutex);
-        std::wcout << L"HID [" << device.index << L"] read stopped: "
+        std::wcout << L"HID [" << device.index << L"] 读取已停止："
                    << error << L" " << LastErrorText(error) << std::endl;
     }
 
@@ -826,6 +1191,17 @@ namespace
 
     const HidDevice* FindHidppDevice(const std::vector<HidDevice>& devices)
     {
+        if (!g_targetMouseId.empty())
+        {
+            for (size_t i = 0; i < devices.size(); ++i)
+            {
+                if (IsHidppInterface(devices[i]) && DeviceMatchesTarget(devices[i]))
+                {
+                    return &devices[i];
+                }
+            }
+        }
+
         for (size_t i = 0; i < devices.size(); ++i)
         {
             if (IsHidppInterface(devices[i]))
@@ -842,11 +1218,13 @@ namespace
 
         if (hidppDevice == NULL)
         {
-            std::wcout << L"No HID++ interface found." << std::endl;
+            std::wcout << L"未找到 HID++ 接口。" << std::endl;
             return;
         }
 
-        std::wcout << L"HID++ candidate: [" << hidppDevice->index << L"] PID=" << HexWord(hidppDevice->productId)
+        std::wcout << L"HID++ 候选接口：[" << hidppDevice->index << L"] PID=" << HexWord(hidppDevice->productId)
+                   << L" name=\"" << hidppDevice->displayName << L"\""
+                   << L" deviceId=" << hidppDevice->deviceId
                    << L" page=" << HexWord(hidppDevice->usagePage)
                    << L" usage=" << HexWord(hidppDevice->usage)
                    << std::endl;
@@ -854,14 +1232,14 @@ namespace
         HidppSession session(*hidppDevice);
         if (!session.Open())
         {
-            std::wcout << L"Could not open HID++ interface for read/write." << std::endl;
+            std::wcout << L"无法打开 HID++ 接口进行读写。" << std::endl;
             return;
         }
 
         HidppBasics basics;
         if (!GetHidppBasics(&session, &basics))
         {
-            std::wcout << L"HID++ root query did not respond on common device indexes." << std::endl;
+            std::wcout << L"HID++ root 查询在常见 device index 上没有响应。" << std::endl;
             return;
         }
 
@@ -872,12 +1250,12 @@ namespace
         std::vector<BYTE> params;
         if (!HidppRequestParams(&session, basics.deviceIndex, basics.featureSetIndex, 0x00, std::vector<BYTE>(), &params) || params.empty())
         {
-            std::wcout << L"Could not read HID++ feature count." << std::endl;
+            std::wcout << L"无法读取 HID++ feature 数量。" << std::endl;
             return;
         }
 
         BYTE featureCount = params[0];
-        std::wcout << L"HID++ feature count=" << static_cast<int>(featureCount) << std::endl;
+        std::wcout << L"HID++ feature 数量=" << static_cast<int>(featureCount) << std::endl;
 
         for (BYTE i = 0; i < featureCount; ++i)
         {
@@ -909,11 +1287,11 @@ namespace
         std::vector<HidppControl> controls;
         if (!GetHidppControls(&session, basics, &controls))
         {
-            std::wcout << L"Could not read controls." << std::endl;
+            std::wcout << L"无法读取控制项。" << std::endl;
             return;
         }
 
-        std::wcout << L"Control count=" << controls.size() << std::endl;
+        std::wcout << L"控制项数量=" << controls.size() << std::endl;
         for (size_t i = 0; i < controls.size(); ++i)
         {
             std::wcout << L"  control[" << std::setw(2) << std::setfill(L' ') << static_cast<int>(i) << L"]"
@@ -926,14 +1304,19 @@ namespace
         }
     }
 
+    void WriteDetectedCidConfigResults(const HidDevice& device, const std::vector<USHORT>& cids);
+    void WriteAllDetectedCidConfigResults();
+
     void DivertAndWatch(const std::vector<HidDevice>& devices)
     {
         const HidDevice* hidppDevice = FindHidppDevice(devices);
         if (hidppDevice == NULL)
         {
-            std::wcout << L"No HID++ interface found." << std::endl;
+            std::wcout << L"未找到 HID++ 接口。" << std::endl;
             return;
         }
+        g_detectedDevicesById.clear();
+        g_detectedCidsById.clear();
 
         HidppBasics basics;
         std::vector<HidppControl> controls;
@@ -943,17 +1326,17 @@ namespace
             HidppSession session(*hidppDevice);
             if (!session.Open())
             {
-                std::wcout << L"Could not open HID++ interface for read/write." << std::endl;
+                std::wcout << L"无法打开 HID++ 接口进行读写。" << std::endl;
                 return;
             }
 
             if (!GetHidppBasics(&session, &basics) || !GetHidppControls(&session, basics, &controls))
             {
-                std::wcout << L"Could not initialize HID++ controls." << std::endl;
+                std::wcout << L"无法初始化 HID++ 控制项。" << std::endl;
                 return;
             }
 
-            std::wcout << L"Temporarily diverting controls with the divert flag." << std::endl;
+            std::wcout << L"正在临时开启 HID++ divert 模式。" << std::endl;
             for (size_t i = 0; i < controls.size(); ++i)
             {
                 bool divertable = (controls[i].flags & 0x20) != 0;
@@ -967,7 +1350,7 @@ namespace
                 if (SetCidReporting(&session, basics, controls[i].cid, true, rawXYCapable))
                 {
                     divertedCids.push_back(controls[i].cid);
-                    std::wcout << L"  diverted cid=" << HexWord(controls[i].cid)
+                    std::wcout << L"  已接管 cid=" << HexWord(controls[i].cid)
                                << L" tid=" << HexWord(controls[i].tid)
                                << (rawXYCapable ? L" rawXY" : L"")
                                << std::endl;
@@ -977,13 +1360,13 @@ namespace
 
         if (divertedCids.empty())
         {
-            std::wcout << L"No controls were diverted." << std::endl;
+            std::wcout << L"没有找到可接管的控制项。" << std::endl;
             return;
         }
 
         std::wcout << std::endl;
-        std::wcout << L"Now press the buttons that were previously invisible." << std::endl;
-        std::wcout << L"Watch for HID reports containing cid values. Press Esc or Ctrl+C to stop." << std::endl;
+        std::wcout << L"现在请按之前看不到输出的鼠标按键。" << std::endl;
+        std::wcout << L"这里会监听包含 CID 的 HID 报告。按 Esc 或 Ctrl+C 停止。" << std::endl;
         std::wcout << std::endl;
 
         std::thread reader(ReaderThread, *hidppDevice);
@@ -1009,7 +1392,7 @@ namespace
             reader.join();
         }
 
-        std::wcout << L"Restoring diverted controls." << std::endl;
+        std::wcout << L"正在恢复临时接管的控制项。" << std::endl;
         HidppSession restoreSession(*hidppDevice);
         if (restoreSession.Open())
         {
@@ -1018,6 +1401,8 @@ namespace
                 SetCidReporting(&restoreSession, basics, divertedCids[i], false, false);
             }
         }
+
+        WriteAllDetectedCidConfigResults();
     }
 
     struct GuideStep
@@ -1033,6 +1418,47 @@ namespace
         USHORT cid = 0;
         std::vector<BYTE> report;
     };
+
+    void WriteDetectedCidConfigResults(const HidDevice& device, const std::vector<USHORT>& cids)
+    {
+        std::vector<std::string> lines;
+        for (size_t i = 0; i < cids.size(); ++i)
+        {
+            lines.push_back("# " + CidName(cids[i]) + " = Ctrl+Shift+P");
+        }
+        AppendLinesToMouseBlock(device, lines);
+    }
+
+    void WriteAllDetectedCidConfigResults()
+    {
+        for (std::map<std::wstring, std::vector<USHORT> >::const_iterator it = g_detectedCidsById.begin(); it != g_detectedCidsById.end(); ++it)
+        {
+            std::map<std::wstring, HidDevice>::const_iterator device = g_detectedDevicesById.find(it->first);
+            if (device != g_detectedDevicesById.end())
+            {
+                WriteDetectedCidConfigResults(device->second, it->second);
+            }
+        }
+    }
+
+    void WriteGuideConfigResults(const HidDevice& device, const std::vector<GuideResult>& results)
+    {
+        std::vector<std::string> lines;
+        for (size_t i = 0; i < results.size(); ++i)
+        {
+            if (!results[i].detected)
+            {
+                continue;
+            }
+            std::string name = Utf8String(results[i].name);
+            if (!name.empty())
+            {
+                lines.push_back("# " + name);
+            }
+            lines.push_back("# " + CidName(results[i].cid) + " = Ctrl+Shift+P");
+        }
+        AppendLinesToMouseBlock(device, lines);
+    }
 
     bool WaitForGuideCid(const HidDevice& device, const HidppBasics& basics, DWORD timeoutMs, USHORT* cid, std::vector<BYTE>* report)
     {
@@ -1118,23 +1544,78 @@ namespace
         return found;
     }
 
-    void RunMxMaster4Guide(const std::vector<HidDevice>& devices)
+    const GuideStep* SelectGuideSteps(const HidDevice& device, size_t* count, const wchar_t** title, const wchar_t** summary)
+    {
+        static const GuideStep mxMaster3Steps[] = {
+            { L"侧边横向滚轮向左", L"请把拇指横向滚轮向左滚动一格；如果不想配置它，按 S 跳过。" },
+            { L"侧边横向滚轮向右", L"请把拇指横向滚轮向右滚动一格；如果不想配置它，按 S 跳过。" },
+            { L"侧边后退键", L"请按一次拇指侧后方的后退键。" },
+            { L"侧边前进键", L"请按一次拇指侧前方的前进键。" },
+            { L"拇指 Gesture 键", L"请按一次拇指托 / Gesture 键。" },
+            { L"顶部滚轮模式切换键", L"可选：请按一次主滚轮后方的滚轮模式切换键；不配置就按 S 跳过。" },
+            { L"主滚轮中键", L"可选：请向下按一次主滚轮；不配置就按 S 跳过。" },
+        };
+
+        static const GuideStep mxMaster4Steps[] = {
+            { L"侧边横向滚轮向左", L"请把拇指横向滚轮向左滚动一格；如果不想配置它，按 S 跳过。" },
+            { L"侧边横向滚轮向右", L"请把拇指横向滚轮向右滚动一格；如果不想配置它，按 S 跳过。" },
+            { L"侧边后退键", L"请按一次侧边后退键。" },
+            { L"侧边前进键", L"请按一次侧边前进键。" },
+            { L"侧边 Gesture 键", L"请按一次侧边第三个实体键，也就是官方标注的 Gesture button。" },
+            { L"Haptic Sense Panel / Actions Ring", L"请按一次或轻触拇指托上的 Haptic Sense Panel / Actions Ring 区域。" },
+            { L"顶部滚轮模式切换键", L"可选：请按一次主滚轮后方的滚轮模式切换键；不配置就按 S 跳过。" },
+            { L"主滚轮中键", L"可选：请向下按一次主滚轮；不配置就按 S 跳过。" },
+        };
+
+        static const GuideStep mxAnywhere3Steps[] = {
+            { L"侧边后退键", L"请按一次拇指侧后方的后退键。" },
+            { L"侧边前进键", L"请按一次拇指侧前方的前进键。" },
+            { L"顶部滚轮模式切换键", L"可选：请按一次主滚轮后方的滚轮模式切换键；不配置就按 S 跳过。" },
+            { L"主滚轮中键", L"可选：请向下按一次主滚轮；不配置就按 S 跳过。" },
+        };
+
+        static const GuideStep genericSteps[] = {
+            { L"第一个特殊按键", L"请按一个想配置的鼠标特殊按键；不配置就按 S 跳过。" },
+            { L"第二个特殊按键", L"请按另一个想配置的鼠标特殊按键；不配置就按 S 跳过。" },
+            { L"第三个特殊按键", L"请再按一个想配置的鼠标特殊按键；不配置就按 S 跳过。" },
+            { L"可选滚轮或模式键", L"可选：请按一个滚轮键或模式键；不配置就按 S 跳过。" },
+        };
+
+        switch (device.productId)
+        {
+            case 0xB023:
+                *count = sizeof(mxMaster3Steps) / sizeof(mxMaster3Steps[0]);
+                *title = L"MX Master 3 按键引导";
+                *summary = L"使用实际 MX Master 3 布局：拇指横向滚轮、后退/前进、Gesture 键，然后是顶部可选按键。";
+                return mxMaster3Steps;
+            case 0xB042:
+                *count = sizeof(mxMaster4Steps) / sizeof(mxMaster4Steps[0]);
+                *title = L"MX Master 4 按键引导";
+                *summary = L"使用实际 MX Master 4 布局：拇指横向滚轮、侧边按键、Haptic Sense Panel，然后是顶部可选按键。";
+                return mxMaster4Steps;
+            case 0xB025:
+                *count = sizeof(mxAnywhere3Steps) / sizeof(mxAnywhere3Steps[0]);
+                *title = L"MX Anywhere 3 按键引导";
+                *summary = L"使用实际 MX Anywhere 3 布局：侧边按键，然后是顶部可选按键。";
+                return mxAnywhere3Steps;
+            default:
+                *count = sizeof(genericSteps) / sizeof(genericSteps[0]);
+                *title = L"通用 Logitech HID++ 按键引导";
+                *summary = L"当前 Logitech 鼠标型号不在内置引导表里，因此使用通用顺序记录实际按键。";
+                return genericSteps;
+        }
+    }
+
+    void RunMouseGuide(const std::vector<HidDevice>& devices)
     {
         const HidDevice* hidppDevice = FindHidppDevice(devices);
         if (hidppDevice == NULL)
         {
-            ConsoleWriteLine(L"未找到 MX Master 4 的 HID++ 接口。");
+            ConsoleWriteLine(L"未找到 Logitech HID++ 接口。");
             return;
         }
 
-        if (hidppDevice->productId != 0xB042)
-        {
-            ConsoleWriteLine(L"警告：期望 MX Master 4 PID 0xB042，实际发现 PID=" + HexWord(hidppDevice->productId) + L"。");
-        }
-        else
-        {
-            ConsoleWriteLine(L"已检测到 MX Master 4：PID=" + HexWord(hidppDevice->productId) + L"。");
-        }
+        ConsoleWriteLine(L"引导目标：" + hidppDevice->displayName + L" deviceId=" + hidppDevice->deviceId + L" PID=" + HexWord(hidppDevice->productId));
 
         HidppBasics basics;
         std::vector<HidppControl> controls;
@@ -1154,7 +1635,7 @@ namespace
                 return;
             }
 
-            ConsoleWriteLine(L"正在临时启用 HID++ 软件接管模式。");
+            ConsoleWriteLine(L"正在临时开启 HID++ divert 模式。");
             for (size_t i = 0; i < controls.size(); ++i)
             {
                 bool divertable = (controls[i].flags & 0x20) != 0;
@@ -1174,39 +1655,32 @@ namespace
 
         if (divertedCids.empty())
         {
-            ConsoleWriteLine(L"没有可接管的控制项。");
+            ConsoleWriteLine(L"没有找到可接管的控制项。");
             return;
         }
 
-        static const GuideStep steps[] = {
-            { L"侧边横向滚轮向左", L"先从侧边横向滚轮开始：请将拇指横向滚轮向左滚动一格；如果不想识别滚轮，按 S 跳过。" },
-            { L"侧边横向滚轮向右", L"请将拇指横向滚轮向右滚动一格；如果不想识别滚轮，按 S 跳过。" },
-            { L"侧边后退键", L"请按一下侧边 3 个实体按钮里的后退键。" },
-            { L"侧边前进键", L"请按一下侧边 3 个实体按钮里的前进键。" },
-            { L"侧边第三键 / 官方 Gesture button", L"请按一下侧边 3 个实体按钮里的第三个按钮，也就是官方标注的 Gesture button。" },
-            { L"拇指托 Haptic Sense Panel / Actions Ring", L"请按一下或轻触拇指托上的触觉面板，也就是用于打开 Actions Ring 的区域。" },
-            { L"顶部滚轮模式切换键", L"可选：请按一下主滚轮后方的滚轮模式切换键；如果不想识别，按 S 跳过。" },
-            { L"主滚轮中键", L"可选：请向下按一下主滚轮；如果不想识别，按 S 跳过。" },
-        };
+        size_t stepCount = 0;
+        const wchar_t* title = L"鼠标按键引导";
+        const wchar_t* summary = L"";
+        const GuideStep* steps = SelectGuideSteps(*hidppDevice, &stepCount, &title, &summary);
 
         std::vector<GuideResult> results;
         ConsoleWriteLine();
-        ConsoleWriteLine(L"MX Master 4 按键引导识别");
-        ConsoleWriteLine(L"流程按官方布局识别：侧边横向滚轮、侧边三键、拇指托 Haptic Sense Panel，再到顶部可选键。");
-        ConsoleWriteLine(L"每一步都会在你按下 Enter 后，记录第一个 HID++ CID 事件。");
-        ConsoleWriteLine(L"按 S 跳过当前步骤；按 Esc 或 Ctrl+C 退出。");
+        ConsoleWriteLine(title);
+        ConsoleWriteLine(summary);
+        ConsoleWriteLine(L"每一步请先按 Enter，然后在 5 秒内完成对应的鼠标动作。");
+        ConsoleWriteLine(L"按 S 跳过当前步骤。按 Esc 或 Ctrl+C 退出。");
         ConsoleWriteLine();
 
-        for (size_t i = 0; i < sizeof(steps) / sizeof(steps[0]); ++i)
+        for (size_t i = 0; i < stepCount; ++i)
         {
             GuideResult result;
             result.name = steps[i].name;
 
             std::wstringstream stepLine;
-            stepLine << L"步骤 " << (i + 1) << L"/" << (sizeof(steps) / sizeof(steps[0])) << L"：" << steps[i].name;
+            stepLine << L"步骤 " << (i + 1) << L"/" << stepCount << L"：" << steps[i].name;
             ConsoleWriteLine(stepLine.str());
             ConsoleWriteLine(std::wstring(L"  ") + steps[i].instruction);
-            ConsoleWriteLine(L"  请先按 Enter，然后在 5 秒内完成这个鼠标动作。S=跳过，Esc=退出。");
             ConsoleWriteLine(L"  等待输入：Enter=开始本步骤，S=跳过，Esc=退出。");
 
             int key = _getch();
@@ -1234,13 +1708,13 @@ namespace
                 std::wstringstream detected;
                 detected << L"  已识别：CID" << std::uppercase << std::hex << std::setw(4) << std::setfill(L'0') << cid
                          << std::dec << std::setfill(L' ')
-                         << L" data=" << BytesToHex(report.data(), static_cast<DWORD>(report.size()), 64);
+                         << L" 数据=" << BytesToHex(report.data(), static_cast<DWORD>(report.size()), 64);
                 ConsoleWriteLine(detected.str());
                 ConsoleWriteLine();
             }
             else
             {
-                ConsoleWriteLine(L"  这一步没有识别到 HID++ CID");
+                ConsoleWriteLine(L"  这一步没有识别到 HID++ CID。");
                 ConsoleWriteLine();
             }
 
@@ -1259,7 +1733,7 @@ namespace
         }
 
         ConsoleWriteLine();
-        ConsoleWriteLine(L"识别结果：");
+        ConsoleWriteLine(L"引导结果：");
         for (size_t i = 0; i < results.size(); ++i)
         {
             std::wstringstream line;
@@ -1276,28 +1750,26 @@ namespace
             ConsoleWriteLine(line.str());
         }
 
-        ConsoleWriteLine();
-        ConsoleWriteLine(L"配置模板：");
-        for (size_t i = 0; i < results.size(); ++i)
-        {
-            if (results[i].detected)
-            {
-                ConsoleWriteLine(std::wstring(L"# ") + results[i].name);
-                std::wstringstream configLine;
-                configLine << L"CID" << std::uppercase << std::hex << std::setw(4) << std::setfill(L'0') << results[i].cid
-                           << std::dec << std::setfill(L' ')
-                           << L" = Ctrl+Shift+P";
-                ConsoleWriteLine(configLine.str());
-            }
-        }
+        WriteGuideConfigResults(*hidppDevice, results);
     }
+
+    void RunMxMaster4Guide(const std::vector<HidDevice>& devices)
+    {
+        ConsoleWriteLine(L"--mx-master-4-guide 已改为实际鼠标引导流程。");
+        RunMouseGuide(devices);
+    }
+
 }
 
 int wmain(int argc, wchar_t** argv)
 {
+    _setmode(_fileno(stdout), _O_U8TEXT);
+    _setmode(_fileno(stderr), _O_U8TEXT);
+
     bool listOnly = false;
     bool hidppInfo = false;
     bool divertWatch = false;
+    bool mouseGuide = false;
     bool mxMaster4Guide = false;
     for (int i = 1; i < argc; ++i)
     {
@@ -1313,24 +1785,36 @@ int wmain(int argc, wchar_t** argv)
         {
             divertWatch = true;
         }
-        else if (_wcsicmp(argv[i], L"--mx-master-4-guide") == 0 || _wcsicmp(argv[i], L"--guide") == 0)
+        else if (_wcsicmp(argv[i], L"--guide") == 0)
+        {
+            mouseGuide = true;
+        }
+        else if (_wcsicmp(argv[i], L"--mx-master-4-guide") == 0)
         {
             mxMaster4Guide = true;
         }
+        else if ((_wcsicmp(argv[i], L"--mouse") == 0 || _wcsicmp(argv[i], L"--device") == 0 || _wcsicmp(argv[i], L"--id") == 0) && i + 1 < argc)
+        {
+            g_targetMouseId = NormalizeDeviceId(argv[++i]);
+        }
     }
 
-    std::wcout << L"MouseLogi HID Probe" << std::endl;
-    std::wcout << L"Directly reads Logitech VID_046D HID input reports." << std::endl;
+    std::wcout << L"MouseLogi HID 探测工具" << std::endl;
+    std::wcout << L"直接读取 Logitech VID_046D HID 输入报告。" << std::endl;
     if (!listOnly)
     {
-        std::wcout << L"Press suspect mouse buttons one by one. Press Esc or Ctrl+C to exit." << std::endl;
+        std::wcout << L"请逐个按可疑鼠标按键。按 Esc 或 Ctrl+C 退出。" << std::endl;
+    }
+    if (!g_targetMouseId.empty())
+    {
+        std::wcout << L"目标鼠标 ID：" << g_targetMouseId << std::endl;
     }
     std::wcout << std::endl;
 
     g_stopEvent = CreateEventW(NULL, TRUE, FALSE, NULL);
     if (g_stopEvent == NULL)
     {
-        std::wcerr << L"Failed to create stop event." << std::endl;
+        std::wcerr << L"创建停止事件失败。" << std::endl;
         return 1;
     }
 
@@ -1350,6 +1834,13 @@ int wmain(int argc, wchar_t** argv)
     if (divertWatch)
     {
         DivertAndWatch(devices);
+        CloseHandle(g_stopEvent);
+        return 0;
+    }
+
+    if (mouseGuide)
+    {
+        RunMouseGuide(devices);
         CloseHandle(g_stopEvent);
         return 0;
     }
@@ -1378,13 +1869,13 @@ int wmain(int argc, wchar_t** argv)
 
     if (threads.empty())
     {
-        std::wcout << L"No readable Logitech HID input interfaces were found." << std::endl;
-        std::wcout << L"Try closing Logi Options+ if it is running, then run this probe again." << std::endl;
+        std::wcout << L"没有找到可读取的 Logitech HID 输入接口。" << std::endl;
+        std::wcout << L"如果 Logi Options+ 正在运行，请先关闭它，再重新运行这个探测工具。" << std::endl;
     }
     else
     {
-        std::wcout << L"Reading " << threads.size() << L" HID input interface(s)." << std::endl;
-        std::wcout << L"Reports are printed only when bytes change." << std::endl;
+        std::wcout << L"正在读取 " << threads.size() << L" 个 HID 输入接口。" << std::endl;
+        std::wcout << L"只有字节发生变化时才会打印报告。" << std::endl;
         std::wcout << std::endl;
     }
 
@@ -1413,6 +1904,8 @@ int wmain(int argc, wchar_t** argv)
             threads[i].join();
         }
     }
+
+    WriteAllDetectedCidConfigResults();
 
     CloseHandle(g_stopEvent);
     return 0;

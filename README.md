@@ -35,6 +35,24 @@
 
 配置文件在 `.\bin\native\config.ini`。修改配置后用 `--reset` 重启进程生效。
 
+如果同一台电脑配过多只 Logitech 鼠标，可以用鼠标 ID 分块。鼠标 ID 使用蓝牙设备地址，例如当前这只 `MX Master 3` 是 `C7284491160D`：
+
+```ini
+# 全局配置，所有鼠标都使用
+XButton1 = Alt+Left
+XButton2 = Alt+Right
+
+[mouse:C7284491160D]
+CID0053 = RightAlt
+CID0056 = Alt+Right
+
+[mouse:DF981F4DA84A]
+CID0053 = Win+Shift+S
+CID0056 = Alt+Left
+```
+
+块名也可以写成 `[device:C7284491160D]` 或 `[id:C7284491160D]`。没有块名的配置仍按全局配置处理；匹配当前鼠标 ID 的配置块会按文件顺序覆盖前面的同名按键。
+
 Logitech HID++ 特殊按钮也可以直接用 CID 配置。只有配置里出现 `CIDxxxx` 时，程序才会启用 HID++ divert：
 
 ```ini
@@ -51,6 +69,18 @@ CID00C3 = Win+Shift+S
 .\bin\native\MouseLogiProbe.exe
 ```
 
+只列出 Raw Input 设备和可识别的鼠标名称/ID：
+
+```powershell
+.\bin\native\MouseLogiProbe.exe --list
+```
+
+带上目标鼠标 ID 调试。退出时会按 Raw Input 实际识别到的鼠标 ID，把本次检测到的标准鼠标事件以注释模板记录到对应配置块；如果按到的不是目标鼠标，会写入实际那只鼠标的配置块：
+
+```powershell
+.\bin\native\MouseLogiProbe.exe --mouse C7284491160D
+```
+
 打开后逐个按鼠标键。`HOOK mouse` 是低级鼠标 Hook 看到的标准事件，`RAW mouse` 是 Raw Input 鼠标事件，`RAW key` 是键盘类事件，`RAW hid` 是消费控制类 HID 事件。按 `Esc` 退出。某个键如果完全没有输出，说明它没有通过标准 Windows 鼠标/键盘事件暴露，通常要走更底层的 HID 解析。
 
 直接读取 Logitech HID input report：
@@ -65,6 +95,15 @@ CID00C3 = Win+Shift+S
 .\bin\native\MouseLogiHidProbe.exe --list
 ```
 
+输出中的 `deviceId=...` 就是配置块里的鼠标 ID。
+
+HID++ 调试也可以带目标鼠标 ID。`--divert-watch` 或 `--guide` 退出时会按实际 HID++ 设备 ID，把检测到的 CID 以注释模板记录到对应配置块；如果目标 ID 不在线，会退回当前可识别的 HID++ 鼠标：
+
+```powershell
+.\bin\native\MouseLogiHidProbe.exe --divert-watch --mouse C7284491160D
+.\bin\native\MouseLogiHidProbe.exe --guide --mouse C7284491160D
+```
+
 只读枚举 HID++ feature 和可重编程控制表：
 
 ```powershell
@@ -77,13 +116,19 @@ CID00C3 = Win+Shift+S
 .\bin\native\MouseLogiHidProbe.exe --divert-watch
 ```
 
-按 MX Master 4 的物理按键顺序引导识别 CID：
+按实际识别到的鼠标型号引导识别 CID：
+
+```powershell
+.\bin\native\MouseLogiHidProbe.exe --guide
+```
+
+`--guide` 会根据当前 HID++ 鼠标的 PID 选择引导步骤，例如 MX Master 3 会使用侧边横向滚轮、后退/前进键、Gesture 键和顶部可选键；MX Master 4 才会包含 Haptic Sense Panel / Actions Ring。每一步按提示先按 `Enter`，再按对应鼠标键；程序会记录第一个 HID++ CID，并把注释模板写入实际鼠标 ID 对应的配置块。
+
+如果确实要跑旧的 MX Master 4 专用顺序，也可以显式使用：
 
 ```powershell
 .\bin\native\MouseLogiHidProbe.exe --mx-master-4-guide
 ```
-
-引导顺序按 MX Master 4 官方布局调整为：侧边横向滚轮左/右、侧边后退键、侧边前进键、侧边第三键/官方 Gesture button、拇指托 Haptic Sense Panel / Actions Ring，然后可选识别顶部滚轮模式切换键、主滚轮中键。每一步按提示先按 `Enter`，再按对应鼠标键；程序会记录第一个 HID++ CID 并在最后输出配置模板。
 
 这个模式会改变当前连接期间的按钮上报方式；退出时会尝试恢复。如果程序被强制结束后按钮行为异常，关闭鼠标再打开即可恢复。
 
@@ -141,5 +186,7 @@ WheelRight = Ctrl+PageDown
 ## 限制
 
 这个程序监听的是 Windows 标准鼠标事件，所以它会对所有鼠标生效，不只限制在 Logitech 鼠标上。
+
+鼠标 ID 配置块用于启动时选择当前 Logitech HID++ 设备的配置；低级鼠标 Hook 本身不带来源设备 ID，所以 `XButton1`、`MButton` 这类标准鼠标事件仍按当前选中的配置全局生效。
 
 MX 系列的部分特殊键如果没有被 Windows 上报为标准按钮或滚轮事件，这个轻量版本就捕获不到。那种情况需要改成 Raw Input/HID 方式，复杂度会明显高一些。

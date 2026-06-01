@@ -21,6 +21,9 @@
 #   RightAlt
 #   RightAlt+E
 #   Win+Shift+S
+#
+# Device-specific blocks are optional. Use the Bluetooth device address shown
+# by MouseLogiHidProbe.exe --list, for example C7284491160D.
 
 XButton1 = Alt+Left
 XButton2 = Alt+Right
@@ -31,3 +34,11 @@ XButton2 = Alt+Right
 # CID0053 = Alt+Left
 # CID0056 = Alt+Right
 # CID00C3 = Win+Shift+S
+
+# [mouse:C7284491160D]
+# CID0053 = RightAlt
+# CID0056 = Alt+Right
+#
+# [mouse:DF981F4DA84A]
+# CID0053 = Win+Shift+S
+# CID0056 = Alt+Left

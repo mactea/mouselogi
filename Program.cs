@@ -216,11 +216,24 @@ XButton2 = Alt+Right
             }
 
             string[] lines = File.ReadAllLines(path, Encoding.UTF8);
+            bool activeSection = true;
             for (int i = 0; i < lines.Length; i++)
             {
                 string raw = lines[i];
                 string line = raw.Trim();
                 if (line.Length == 0 || line.StartsWith("#") || line.StartsWith(";"))
+                {
+                    continue;
+                }
+
+                string sectionName;
+                if (TryParseSectionHeader(line, out sectionName))
+                {
+                    activeSection = IsGlobalSection(sectionName);
+                    continue;
+                }
+
+                if (!activeSection)
                 {
                     continue;
                 }
@@ -254,6 +267,24 @@ XButton2 = Alt+Right
             }
 
             return result;
+        }
+
+        private static bool TryParseSectionHeader(string line, out string sectionName)
+        {
+            if (line.Length >= 2 && line[0] == '[' && line[line.Length - 1] == ']')
+            {
+                sectionName = line.Substring(1, line.Length - 2).Trim();
+                return true;
+            }
+
+            sectionName = null;
+            return false;
+        }
+
+        private static bool IsGlobalSection(string sectionName)
+        {
+            string normalized = sectionName.Replace(" ", "").Replace("-", "").Replace("_", "").ToUpperInvariant();
+            return normalized == "GLOBAL" || normalized == "DEFAULT" || normalized == "ALL";
         }
     }
 
