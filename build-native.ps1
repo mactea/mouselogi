@@ -40,7 +40,7 @@ $cmd = Join-Path $env:TEMP ("build-mouselogi-native-{0}.cmd" -f ([Guid]::NewGuid
 @"
 @echo off
 call "$vcvars" >nul
-cl.exe /nologo /utf-8 /O2 /MT /EHsc /W4 /DUNICODE /D_UNICODE /Fo"$outDir\MouseLogiNative.obj" /Fe"$exe" "$source" user32.lib kernel32.lib shell32.lib hid.lib setupapi.lib /link /SUBSYSTEM:WINDOWS /OPT:REF /OPT:ICF
+cl.exe /nologo /utf-8 /O2 /MT /EHsc /W4 /DUNICODE /D_UNICODE /Fo"$outDir\MouseLogiNative.obj" /Fe"$exe" "$source" user32.lib kernel32.lib shell32.lib gdi32.lib hid.lib setupapi.lib /link /SUBSYSTEM:WINDOWS /OPT:REF /OPT:ICF
 if errorlevel 1 exit /b %errorlevel%
 cl.exe /nologo /utf-8 /O2 /MT /EHsc /W4 /DUNICODE /D_UNICODE /Fo"$outDir\MouseLogiProbe.obj" /Fe"$probeExe" "$probeSource" user32.lib kernel32.lib /link /SUBSYSTEM:CONSOLE /OPT:REF /OPT:ICF
 if errorlevel 1 exit /b %errorlevel%

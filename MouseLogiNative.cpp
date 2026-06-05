@@ -8,7 +8,11 @@
 #include <algorithm>
 #include <atomic>
 #include <cctype>
+#include <cstdio>
+#include <cstdlib>
+#include <cstdint>
 #include <cwchar>
+#include <exception>
 #include <map>
 #include <string>
 #include <thread>
@@ -40,7 +44,14 @@ namespace
     std::map<USHORT, Shortcut> g_hidppShortcuts;
     const wchar_t kSingleInstanceMutexName[] = L"Local\\MouseLogiNative.SingleInstance";
     const wchar_t kQuitEventName[] = L"Local\\MouseLogiNative.QuitEvent";
-    const DWORD kResetWaitMs = 10000;
+    const wchar_t kTrayWindowClassName[] = L"MouseLogiNative.TrayWindow";
+    const DWORD kResetWaitMs = 60000;
+    const DWORD kResetPollMs = 1000;
+    const UINT kTrayIconId = 1;
+    const UINT kTrayCallbackMessage = WM_APP + 1;
+    const UINT kTrayMenuOpenConfig = 1001;
+    const UINT kTrayMenuReset = 1002;
+    const UINT kTrayMenuExit = 1003;
 
     struct HidDevice
     {
@@ -69,6 +80,17 @@ namespace
     std::vector<USHORT> g_divertedCids;
     std::thread g_hidppThread;
     std::atomic<bool> g_hidppStop(false);
+    std::wstring g_configPath;
+    HWND g_trayWindow = NULL;
+    HICON g_trayIcon = NULL;
+    bool g_trayIconVisible = false;
+    bool g_trayEffective = false;
+    bool g_trayWarning = false;
+    size_t g_trayMappingCount = 0;
+    UINT g_taskbarCreatedMessage = 0;
+
+    bool AddTrayIcon(HWND hwnd);
+    void ShowTrayMenu(HWND hwnd);
 
     const char kDefaultConfig[] =
         "# MouseLogi Native config\r\n"
@@ -624,6 +646,505 @@ namespace
         return dir.substr(0, slash);
     }
 
+    std::wstring GetExePath()
+    {
+        wchar_t path[MAX_PATH] = {};
+        DWORD length = GetModuleFileNameW(NULL, path, MAX_PATH);
+        if (length == 0 || length == MAX_PATH)
+        {
+            return L"";
+        }
+
+        return std::wstring(path, length);
+    }
+
+    void AppendLog(const std::string& message)
+    {
+        std::wstring logPath = GetExeDirectory() + L"\\MouseLogiNative.log";
+        HANDLE file = CreateFileW(
+            logPath.c_str(),
+            FILE_APPEND_DATA,
+            FILE_SHARE_READ | FILE_SHARE_WRITE,
+            NULL,
+            OPEN_ALWAYS,
+            FILE_ATTRIBUTE_NORMAL,
+            NULL);
+        if (file == INVALID_HANDLE_VALUE)
+        {
+            return;
+        }
+
+        SYSTEMTIME now = {};
+        GetLocalTime(&now);
+
+        char line[1200] = {};
+        int length = _snprintf_s(
+            line,
+            sizeof(line),
+            _TRUNCATE,
+            "%04u-%02u-%02u %02u:%02u:%02u.%03u pid=%lu %s\r\n",
+            static_cast<unsigned int>(now.wYear),
+            static_cast<unsigned int>(now.wMonth),
+            static_cast<unsigned int>(now.wDay),
+            static_cast<unsigned int>(now.wHour),
+            static_cast<unsigned int>(now.wMinute),
+            static_cast<unsigned int>(now.wSecond),
+            static_cast<unsigned int>(now.wMilliseconds),
+            static_cast<unsigned long>(GetCurrentProcessId()),
+            message.c_str());
+        if (length < 0)
+        {
+            length = lstrlenA(line);
+        }
+        if (length > 0)
+        {
+            DWORD written = 0;
+            WriteFile(file, line, static_cast<DWORD>(length), &written, NULL);
+        }
+
+        CloseHandle(file);
+    }
+
+    uint32_t Argb(BYTE alpha, BYTE red, BYTE green, BYTE blue)
+    {
+        return (static_cast<uint32_t>(alpha) << 24) |
+            (static_cast<uint32_t>(red) << 16) |
+            (static_cast<uint32_t>(green) << 8) |
+            static_cast<uint32_t>(blue);
+    }
+
+    void SetIconPixel(uint32_t* pixels, int size, int x, int y, uint32_t color)
+    {
+        if (x < 0 || y < 0 || x >= size || y >= size)
+        {
+            return;
+        }
+
+        pixels[y * size + x] = color;
+    }
+
+    void DrawIconLine(uint32_t* pixels, int size, int x1, int y1, int x2, int y2, int thickness, uint32_t color)
+    {
+        int dx = abs(x2 - x1);
+        int sx = x1 < x2 ? 1 : -1;
+        int dy = -abs(y2 - y1);
+        int sy = y1 < y2 ? 1 : -1;
+        int error = dx + dy;
+        int radius = thickness / 2;
+
+        for (;;)
+        {
+            for (int y = y1 - radius; y <= y1 + radius; ++y)
+            {
+                for (int x = x1 - radius; x <= x1 + radius; ++x)
+                {
+                    SetIconPixel(pixels, size, x, y, color);
+                }
+            }
+
+            if (x1 == x2 && y1 == y2)
+            {
+                break;
+            }
+
+            int twiceError = 2 * error;
+            if (twiceError >= dy)
+            {
+                error += dy;
+                x1 += sx;
+            }
+            if (twiceError <= dx)
+            {
+                error += dx;
+                y1 += sy;
+            }
+        }
+    }
+
+    HICON CreateTrayStatusIcon(bool effective, bool warning)
+    {
+        const int size = 32;
+        HICON fallbackIcon = CopyIcon(LoadIconW(NULL, IDI_APPLICATION));
+        BITMAPV5HEADER header = {};
+        header.bV5Size = sizeof(header);
+        header.bV5Width = size;
+        header.bV5Height = -size;
+        header.bV5Planes = 1;
+        header.bV5BitCount = 32;
+        header.bV5Compression = BI_BITFIELDS;
+        header.bV5RedMask = 0x00FF0000;
+        header.bV5GreenMask = 0x0000FF00;
+        header.bV5BlueMask = 0x000000FF;
+        header.bV5AlphaMask = 0xFF000000;
+
+        HDC dc = GetDC(NULL);
+        void* bits = NULL;
+        HBITMAP colorBitmap = CreateDIBSection(dc, reinterpret_cast<BITMAPINFO*>(&header), DIB_RGB_COLORS, &bits, NULL, 0);
+        ReleaseDC(NULL, dc);
+        if (colorBitmap == NULL || bits == NULL)
+        {
+            return fallbackIcon;
+        }
+
+        uint32_t* pixels = static_cast<uint32_t*>(bits);
+        for (int i = 0; i < size * size; ++i)
+        {
+            pixels[i] = 0;
+        }
+
+        BYTE red = effective ? 20 : (warning ? 220 : 115);
+        BYTE green = effective ? 150 : (warning ? 145 : 115);
+        BYTE blue = effective ? 80 : (warning ? 25 : 115);
+        uint32_t fill = Argb(255, red, green, blue);
+        uint32_t edge = Argb(255, 255, 255, 255);
+        uint32_t dark = Argb(255, 35, 35, 35);
+
+        int center = size / 2;
+        int radius = 14;
+        for (int y = 0; y < size; ++y)
+        {
+            for (int x = 0; x < size; ++x)
+            {
+                int dx = x - center;
+                int dy = y - center;
+                int distance = dx * dx + dy * dy;
+                if (distance <= radius * radius)
+                {
+                    SetIconPixel(pixels, size, x, y, fill);
+                }
+            }
+        }
+
+        if (effective)
+        {
+            DrawIconLine(pixels, size, 8, 17, 13, 22, 4, edge);
+            DrawIconLine(pixels, size, 13, 22, 24, 10, 4, edge);
+        }
+        else
+        {
+            uint32_t mark = warning ? dark : edge;
+            DrawIconLine(pixels, size, 16, 9, 16, 20, 4, mark);
+            DrawIconLine(pixels, size, 16, 24, 16, 24, 4, mark);
+        }
+
+        std::vector<BYTE> maskBits(size * 4, 0);
+        HBITMAP maskBitmap = CreateBitmap(size, size, 1, 1, maskBits.data());
+        if (maskBitmap == NULL)
+        {
+            DeleteObject(colorBitmap);
+            return fallbackIcon;
+        }
+
+        ICONINFO iconInfo = {};
+        iconInfo.fIcon = TRUE;
+        iconInfo.hbmColor = colorBitmap;
+        iconInfo.hbmMask = maskBitmap;
+
+        HICON icon = CreateIconIndirect(&iconInfo);
+        DeleteObject(colorBitmap);
+        DeleteObject(maskBitmap);
+        if (icon != NULL && fallbackIcon != NULL)
+        {
+            DestroyIcon(fallbackIcon);
+        }
+        return icon != NULL ? icon : fallbackIcon;
+    }
+
+    size_t CountStandardShortcuts()
+    {
+        size_t count = 0;
+        for (int i = 0; i < TriggerCount; ++i)
+        {
+            if (g_shortcuts[i].enabled)
+            {
+                ++count;
+            }
+        }
+
+        return count;
+    }
+
+    size_t CountHidppShortcuts()
+    {
+        size_t count = 0;
+        for (std::map<USHORT, Shortcut>::const_iterator it = g_hidppShortcuts.begin(); it != g_hidppShortcuts.end(); ++it)
+        {
+            if (it->second.enabled)
+            {
+                ++count;
+            }
+        }
+
+        return count;
+    }
+
+    std::wstring BuildTrayTooltip()
+    {
+        if (g_trayEffective)
+        {
+            return L"MouseLogi: shortcuts active (" + std::to_wstring(g_trayMappingCount) + L" mappings)";
+        }
+
+        if (g_trayWarning)
+        {
+            return L"MouseLogi: HID++ shortcuts unavailable";
+        }
+
+        return L"MouseLogi: no active shortcuts";
+    }
+
+    void FillTrayData(NOTIFYICONDATAW* data, HWND hwnd)
+    {
+        ZeroMemory(data, sizeof(*data));
+        data->cbSize = sizeof(*data);
+        data->hWnd = hwnd;
+        data->uID = kTrayIconId;
+    }
+
+    bool AddTrayIcon(HWND hwnd)
+    {
+        if (hwnd == NULL)
+        {
+            return false;
+        }
+
+        NOTIFYICONDATAW data = {};
+        FillTrayData(&data, hwnd);
+        data.uFlags = NIF_MESSAGE | NIF_ICON | NIF_TIP;
+        data.uCallbackMessage = kTrayCallbackMessage;
+        data.hIcon = g_trayIcon;
+
+        std::wstring tooltip = BuildTrayTooltip();
+        lstrcpynW(data.szTip, tooltip.c_str(), ARRAYSIZE(data.szTip));
+
+        BOOL ok = Shell_NotifyIconW(g_trayIconVisible ? NIM_MODIFY : NIM_ADD, &data);
+        if (!ok && g_trayIconVisible)
+        {
+            ok = Shell_NotifyIconW(NIM_ADD, &data);
+        }
+
+        if (!ok)
+        {
+            AppendLog("Shell_NotifyIcon add failed");
+            return false;
+        }
+
+        data.uVersion = NOTIFYICON_VERSION_4;
+        Shell_NotifyIconW(NIM_SETVERSION, &data);
+        g_trayIconVisible = true;
+        return true;
+    }
+
+    void RemoveTrayIcon()
+    {
+        if (!g_trayIconVisible || g_trayWindow == NULL)
+        {
+            return;
+        }
+
+        NOTIFYICONDATAW data = {};
+        FillTrayData(&data, g_trayWindow);
+        Shell_NotifyIconW(NIM_DELETE, &data);
+        g_trayIconVisible = false;
+    }
+
+    void OpenConfigFile()
+    {
+        if (g_configPath.empty())
+        {
+            return;
+        }
+
+        HINSTANCE result = ShellExecuteW(NULL, L"open", g_configPath.c_str(), NULL, NULL, SW_SHOWNORMAL);
+        if (reinterpret_cast<INT_PTR>(result) <= 32)
+        {
+            AppendLog("open config failed");
+        }
+    }
+
+    bool LaunchResetInstance()
+    {
+        std::wstring exePath = GetExePath();
+        if (exePath.empty())
+        {
+            return false;
+        }
+
+        std::wstring commandLine = L"\"" + exePath + L"\" --reset";
+        STARTUPINFOW startup = {};
+        startup.cb = sizeof(startup);
+        PROCESS_INFORMATION processInfo = {};
+
+        BOOL ok = CreateProcessW(
+            NULL,
+            &commandLine[0],
+            NULL,
+            NULL,
+            FALSE,
+            0,
+            NULL,
+            NULL,
+            &startup,
+            &processInfo);
+        if (ok)
+        {
+            CloseHandle(processInfo.hThread);
+            CloseHandle(processInfo.hProcess);
+            return true;
+        }
+
+        AppendLog("launch reset failed; error=" + std::to_string(GetLastError()));
+        return false;
+    }
+
+    void ShowTrayMenu(HWND hwnd)
+    {
+        POINT cursor = {};
+        GetCursorPos(&cursor);
+
+        HMENU menu = CreatePopupMenu();
+        if (menu == NULL)
+        {
+            return;
+        }
+
+        AppendMenuW(menu, MF_STRING, kTrayMenuOpenConfig, L"Open config");
+        AppendMenuW(menu, MF_STRING, kTrayMenuReset, L"Reload shortcuts");
+        AppendMenuW(menu, MF_SEPARATOR, 0, NULL);
+        AppendMenuW(menu, MF_STRING, kTrayMenuExit, L"Exit");
+
+        SetForegroundWindow(hwnd);
+        UINT command = TrackPopupMenu(menu, TPM_RIGHTBUTTON | TPM_RETURNCMD | TPM_NONOTIFY, cursor.x, cursor.y, 0, hwnd, NULL);
+        DestroyMenu(menu);
+        if (command != 0)
+        {
+            SendMessageW(hwnd, WM_COMMAND, command, 0);
+        }
+        PostMessageW(hwnd, WM_NULL, 0, 0);
+    }
+
+    LRESULT CALLBACK TrayWindowProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lParam)
+    {
+        if (g_taskbarCreatedMessage != 0 && message == g_taskbarCreatedMessage)
+        {
+            g_trayIconVisible = false;
+            AddTrayIcon(hwnd);
+            return 0;
+        }
+
+        switch (message)
+        {
+            case kTrayCallbackMessage:
+                if (LOWORD(lParam) == WM_CONTEXTMENU || LOWORD(lParam) == WM_RBUTTONUP)
+                {
+                    ShowTrayMenu(hwnd);
+                }
+                return 0;
+
+            case WM_COMMAND:
+                switch (LOWORD(wParam))
+                {
+                    case kTrayMenuOpenConfig:
+                        OpenConfigFile();
+                        return 0;
+                    case kTrayMenuReset:
+                        LaunchResetInstance();
+                        return 0;
+                    case kTrayMenuExit:
+                        SignalQuitEvent();
+                        return 0;
+                    default:
+                        break;
+                }
+                break;
+
+            default:
+                break;
+        }
+
+        return DefWindowProcW(hwnd, message, wParam, lParam);
+    }
+
+    HWND CreateTrayWindow(HINSTANCE instance)
+    {
+        g_taskbarCreatedMessage = RegisterWindowMessageW(L"TaskbarCreated");
+
+        WNDCLASSEXW windowClass = {};
+        windowClass.cbSize = sizeof(windowClass);
+        windowClass.lpfnWndProc = TrayWindowProc;
+        windowClass.hInstance = instance;
+        windowClass.lpszClassName = kTrayWindowClassName;
+
+        if (!RegisterClassExW(&windowClass) && GetLastError() != ERROR_CLASS_ALREADY_EXISTS)
+        {
+            AppendLog("RegisterClassEx tray failed; error=" + std::to_string(GetLastError()));
+            return NULL;
+        }
+
+        HWND hwnd = CreateWindowExW(
+            0,
+            kTrayWindowClassName,
+            L"MouseLogiNative",
+            WS_OVERLAPPED,
+            0,
+            0,
+            0,
+            0,
+            NULL,
+            NULL,
+            instance,
+            NULL);
+        if (hwnd == NULL)
+        {
+            AppendLog("CreateWindowEx tray failed; error=" + std::to_string(GetLastError()));
+        }
+
+        return hwnd;
+    }
+
+    bool StartTray(HINSTANCE instance, bool hidppStarted)
+    {
+        size_t standardCount = CountStandardShortcuts();
+        size_t hidppCount = CountHidppShortcuts();
+        bool hidppEffective = hidppCount == 0 || hidppStarted;
+
+        g_trayMappingCount = standardCount + (hidppStarted ? hidppCount : 0);
+        g_trayEffective = standardCount > 0 || (hidppStarted && hidppCount > 0);
+        g_trayWarning = hidppCount > 0 && !hidppEffective;
+
+        if (g_trayIcon != NULL)
+        {
+            DestroyIcon(g_trayIcon);
+            g_trayIcon = NULL;
+        }
+        g_trayIcon = CreateTrayStatusIcon(g_trayEffective, g_trayWarning);
+
+        g_trayWindow = CreateTrayWindow(instance);
+        if (g_trayWindow == NULL)
+        {
+            return false;
+        }
+
+        return AddTrayIcon(g_trayWindow);
+    }
+
+    void StopTray()
+    {
+        RemoveTrayIcon();
+
+        if (g_trayWindow != NULL)
+        {
+            DestroyWindow(g_trayWindow);
+            g_trayWindow = NULL;
+        }
+
+        if (g_trayIcon != NULL)
+        {
+            DestroyIcon(g_trayIcon);
+            g_trayIcon = NULL;
+        }
+    }
+
     bool ReadWholeFile(const std::wstring& path, std::string* content)
     {
         HANDLE file = CreateFileW(path.c_str(), GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE, NULL, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
@@ -1052,6 +1573,15 @@ namespace
         g_activeMouseId = devices[0].deviceId;
     }
 
+    void CancelPendingIo(HANDLE handle, OVERLAPPED* overlapped)
+    {
+        if (CancelIoEx(handle, overlapped) || GetLastError() != ERROR_NOT_FOUND)
+        {
+            DWORD transferred = 0;
+            GetOverlappedResult(handle, overlapped, &transferred, TRUE);
+        }
+    }
+
     bool HidppWriteReport(const std::vector<BYTE>& report)
     {
         HANDLE event = CreateEventW(NULL, TRUE, FALSE, NULL);
@@ -1073,7 +1603,7 @@ namespace
             }
             else
             {
-                CancelIo(g_hidppHandle);
+                CancelPendingIo(g_hidppHandle, &overlapped);
                 ok = FALSE;
             }
         }
@@ -1105,7 +1635,7 @@ namespace
             }
             else
             {
-                CancelIo(g_hidppHandle);
+                CancelPendingIo(g_hidppHandle, &overlapped);
                 CloseHandle(event);
                 return false;
             }
@@ -1280,7 +1810,7 @@ namespace
                 DWORD waitResult = WaitForMultipleObjects(2, waitHandles, FALSE, INFINITE);
                 if (waitResult == WAIT_OBJECT_0)
                 {
-                    CancelIo(g_hidppHandle);
+                    CancelPendingIo(g_hidppHandle, &overlapped);
                     CloseHandle(event);
                     break;
                 }
@@ -1288,6 +1818,11 @@ namespace
                 if (waitResult == WAIT_OBJECT_0 + 1)
                 {
                     ok = GetOverlappedResult(g_hidppHandle, &overlapped, &bytesRead, FALSE);
+                }
+                else
+                {
+                    CloseHandle(event);
+                    break;
                 }
             }
 
@@ -1487,39 +2022,69 @@ namespace
 
         return CallNextHookEx(g_hook, nCode, wParam, lParam);
     }
+
+    bool WaitForResetMutex(HANDLE mutex)
+    {
+        DWORD waitedMs = 0;
+        while (waitedMs < kResetWaitMs)
+        {
+            DWORD remainingMs = kResetWaitMs - waitedMs;
+            DWORD waitMs = remainingMs < kResetPollMs ? remainingMs : kResetPollMs;
+            DWORD waitResult = WaitForSingleObject(mutex, waitMs);
+            if (waitResult == WAIT_OBJECT_0 || waitResult == WAIT_ABANDONED)
+            {
+                return true;
+            }
+
+            if (waitResult != WAIT_TIMEOUT)
+            {
+                AppendLog("reset wait failed; error=" + std::to_string(GetLastError()));
+                return false;
+            }
+
+            SignalQuitEvent();
+            waitedMs += waitMs;
+        }
+
+        AppendLog("reset timed out waiting for previous instance");
+        return false;
+    }
 }
 
-int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int)
+int RunMouseLogiNative(HINSTANCE instance)
 {
     bool quitRequested = HasCommandLineArgument(L"--quit") || HasCommandLineArgument(L"quit");
     bool resetRequested = HasCommandLineArgument(L"--reset") || HasCommandLineArgument(L"reset");
 
     if (quitRequested)
     {
-        SignalQuitEvent();
+        bool signaled = SignalQuitEvent();
+        AppendLog(std::string("quit requested; signaled=") + (signaled ? "true" : "false"));
         return 0;
     }
 
     if (resetRequested)
     {
-        SignalQuitEvent();
+        bool signaled = SignalQuitEvent();
+        AppendLog(std::string("reset requested; initial signal=") + (signaled ? "true" : "false"));
     }
 
     HANDLE mutex = CreateMutexW(NULL, TRUE, kSingleInstanceMutexName);
     if (mutex == NULL)
     {
+        AppendLog("CreateMutex failed; error=" + std::to_string(GetLastError()));
         return 1;
     }
     if (GetLastError() == ERROR_ALREADY_EXISTS)
     {
         if (!resetRequested)
         {
+            AppendLog("instance already running; exiting duplicate");
             CloseHandle(mutex);
             return 0;
         }
 
-        DWORD waitResult = WaitForSingleObject(mutex, kResetWaitMs);
-        if (waitResult != WAIT_OBJECT_0 && waitResult != WAIT_ABANDONED)
+        if (!WaitForResetMutex(mutex))
         {
             CloseHandle(mutex);
             return 1;
@@ -1527,12 +2092,14 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int)
     }
 
     std::wstring configPath = GetExeDirectory() + L"\\config.ini";
+    g_configPath = configPath;
     SelectActiveHidppDevice(configPath);
     LoadConfig(configPath, g_activeMouseId);
 
     HANDLE quitEvent = CreateEventW(NULL, FALSE, FALSE, kQuitEventName);
     if (quitEvent == NULL)
     {
+        AppendLog("CreateEvent failed; error=" + std::to_string(GetLastError()));
         CloseHandle(mutex);
         return 1;
     }
@@ -1540,12 +2107,22 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int)
     g_hook = SetWindowsHookExW(WH_MOUSE_LL, MouseHookProc, instance, 0);
     if (g_hook == NULL)
     {
+        AppendLog("SetWindowsHookEx failed; error=" + std::to_string(GetLastError()));
         CloseHandle(quitEvent);
         CloseHandle(mutex);
         return 1;
     }
 
-    StartHidpp();
+    bool hidppStarted = StartHidpp();
+    bool trayStarted = StartTray(instance, hidppStarted);
+    AppendLog(
+        std::string("started; reset=") +
+        (resetRequested ? "true" : "false") +
+        "; activeMouseId=" + g_activeMouseId +
+        "; hidppShortcuts=" + std::to_string(g_hidppShortcuts.size()) +
+        "; hidppStarted=" + (hidppStarted ? "true" : "false") +
+        "; trayStarted=" + (trayStarted ? "true" : "false") +
+        "; trayEffective=" + (g_trayEffective ? "true" : "false"));
 
     MSG message;
     bool running = true;
@@ -1569,9 +2146,30 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int)
         }
     }
 
+    AppendLog("stopping");
+    StopTray();
     StopHidpp();
     UnhookWindowsHookEx(g_hook);
     CloseHandle(quitEvent);
     CloseHandle(mutex);
+    AppendLog("stopped");
     return 0;
+}
+
+int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int)
+{
+    try
+    {
+        return RunMouseLogiNative(instance);
+    }
+    catch (const std::exception& ex)
+    {
+        AppendLog(std::string("fatal exception: ") + ex.what());
+        return 1;
+    }
+    catch (...)
+    {
+        AppendLog("fatal unknown exception");
+        return 1;
+    }
 }
