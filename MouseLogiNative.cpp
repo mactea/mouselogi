@@ -47,6 +47,7 @@ namespace
     const wchar_t kTrayWindowClassName[] = L"MouseLogiNative.TrayWindow";
     const DWORD kResetWaitMs = 60000;
     const DWORD kResetPollMs = 1000;
+    const DWORD kHidppRetryMs = 5000;
     const UINT kTrayIconId = 1;
     const UINT kTrayCallbackMessage = WM_APP + 1;
     const UINT kTrayMenuOpenConfig = 1001;
@@ -74,6 +75,7 @@ namespace
 
     HANDLE g_hidppHandle = INVALID_HANDLE_VALUE;
     HANDLE g_hidppStopEvent = NULL;
+    HANDLE g_hidppRestartEvent = NULL;
     HidDevice g_hidppDevice;
     HidppBasics g_hidppBasics;
     std::string g_activeMouseId;
@@ -1102,7 +1104,7 @@ namespace
         return hwnd;
     }
 
-    bool StartTray(HINSTANCE instance, bool hidppStarted)
+    void UpdateTrayStatus(bool hidppStarted)
     {
         size_t standardCount = CountStandardShortcuts();
         size_t hidppCount = CountHidppShortcuts();
@@ -1119,6 +1121,15 @@ namespace
         }
         g_trayIcon = CreateTrayStatusIcon(g_trayEffective, g_trayWarning);
 
+        if (g_trayWindow != NULL && g_trayIconVisible)
+        {
+            AddTrayIcon(g_trayWindow);
+        }
+    }
+
+    bool StartTray(HINSTANCE instance, bool hidppStarted)
+    {
+        UpdateTrayStatus(hidppStarted);
         g_trayWindow = CreateTrayWindow(instance);
         if (g_trayWindow == NULL)
         {
@@ -1785,26 +1796,53 @@ namespace
         return HidppRequestParams(g_hidppBasics.deviceIndex, g_hidppBasics.specialKeysIndex, 0x03, params, &result);
     }
 
+    void RequestHidppRestart(const std::string& reason, DWORD error)
+    {
+        AppendLog("hidpp restart requested; reason=" + reason + "; error=" + std::to_string(error));
+        if (g_hidppRestartEvent != NULL)
+        {
+            SetEvent(g_hidppRestartEvent);
+        }
+    }
+
+    bool IsHidppDisconnectError(DWORD error)
+    {
+        return error == ERROR_DEVICE_NOT_CONNECTED ||
+            error == ERROR_INVALID_HANDLE ||
+            error == ERROR_OPERATION_ABORTED ||
+            error == ERROR_GEN_FAILURE ||
+            error == ERROR_NO_SYSTEM_RESOURCES ||
+            error == ERROR_NOT_READY;
+    }
+
     void HidppReaderThread()
     {
         std::vector<BYTE> buffer(g_hidppDevice.inputReportLength, 0);
         USHORT activeCid = 0;
+        DWORD consecutiveFailures = 0;
 
         while (!g_hidppStop.load())
         {
             HANDLE event = CreateEventW(NULL, TRUE, FALSE, NULL);
             if (event == NULL)
             {
+                RequestHidppRestart("create_event_failed", GetLastError());
                 return;
             }
 
             OVERLAPPED overlapped = {};
             overlapped.hEvent = event;
             DWORD bytesRead = 0;
+            DWORD readError = ERROR_SUCCESS;
             ResetEvent(event);
 
             BOOL ok = ReadFile(g_hidppHandle, buffer.data(), static_cast<DWORD>(buffer.size()), &bytesRead, &overlapped);
-            if (!ok && GetLastError() == ERROR_IO_PENDING)
+            if (!ok)
+            {
+                readError = GetLastError();
+            }
+
+            if (!ok && readError == ERROR_IO_PENDING)
             {
                 HANDLE waitHandles[2] = { g_hidppStopEvent, event };
                 DWORD waitResult = WaitForMultipleObjects(2, waitHandles, FALSE, INFINITE);
@@ -1818,10 +1856,16 @@ namespace
                 if (waitResult == WAIT_OBJECT_0 + 1)
                 {
                     ok = GetOverlappedResult(g_hidppHandle, &overlapped, &bytesRead, FALSE);
+                    if (!ok)
+                    {
+                        readError = GetLastError();
+                    }
                 }
                 else
                 {
+                    readError = GetLastError();
                     CloseHandle(event);
+                    RequestHidppRestart("wait_failed", readError);
                     break;
                 }
             }
@@ -1829,8 +1873,18 @@ namespace
             CloseHandle(event);
             if (!ok || bytesRead < 6)
             {
+                ++consecutiveFailures;
+                if (IsHidppDisconnectError(readError) || consecutiveFailures >= 5)
+                {
+                    RequestHidppRestart("read_failed", readError);
+                    break;
+                }
+
+                Sleep(50);
                 continue;
             }
+
+            consecutiveFailures = 0;
 
             if (buffer[0] != 0x11 ||
                 buffer[1] != g_hidppBasics.deviceIndex ||
@@ -1867,6 +1921,9 @@ namespace
         {
             return true;
         }
+
+        g_divertedCids.clear();
+        g_hidppBasics = HidppBasics();
 
         if (g_hidppDevice.path.empty() && !FindHidppDevice(&g_hidppDevice))
         {
@@ -1945,11 +2002,32 @@ namespace
             g_hidppHandle = INVALID_HANDLE_VALUE;
         }
 
+        g_divertedCids.clear();
+        g_hidppBasics = HidppBasics();
+
         if (g_hidppStopEvent != NULL)
         {
             CloseHandle(g_hidppStopEvent);
             g_hidppStopEvent = NULL;
         }
+    }
+
+    bool RestartHidpp(const std::wstring& configPath, bool stopCurrent, const char* reason)
+    {
+        if (stopCurrent)
+        {
+            StopHidpp();
+        }
+
+        SelectActiveHidppDevice(configPath);
+        bool started = StartHidpp();
+        UpdateTrayStatus(started);
+        AppendLog(
+            std::string("hidpp restart completed; reason=") +
+            reason +
+            "; activeMouseId=" + g_activeMouseId +
+            "; hidppStarted=" + (started ? "true" : "false"));
+        return started;
     }
 
     bool TryMessageToTrigger(WPARAM message, const MSLLHOOKSTRUCT* data, Trigger* trigger, bool* isRelease)
@@ -2104,10 +2182,21 @@ int RunMouseLogiNative(HINSTANCE instance)
         return 1;
     }
 
+    g_hidppRestartEvent = CreateEventW(NULL, FALSE, FALSE, NULL);
+    if (g_hidppRestartEvent == NULL)
+    {
+        AppendLog("CreateEvent hidpp restart failed; error=" + std::to_string(GetLastError()));
+    }
+
     g_hook = SetWindowsHookExW(WH_MOUSE_LL, MouseHookProc, instance, 0);
     if (g_hook == NULL)
     {
         AppendLog("SetWindowsHookEx failed; error=" + std::to_string(GetLastError()));
+        if (g_hidppRestartEvent != NULL)
+        {
+            CloseHandle(g_hidppRestartEvent);
+            g_hidppRestartEvent = NULL;
+        }
         CloseHandle(quitEvent);
         CloseHandle(mutex);
         return 1;
@@ -2128,10 +2217,32 @@ int RunMouseLogiNative(HINSTANCE instance)
     bool running = true;
     while (running)
     {
-        DWORD waitResult = MsgWaitForMultipleObjects(1, &quitEvent, FALSE, INFINITE, QS_ALLINPUT);
+        HANDLE waitHandles[2] = { quitEvent, g_hidppRestartEvent };
+        DWORD waitHandleCount = g_hidppRestartEvent != NULL ? 2 : 1;
+        DWORD timeout = (!hidppStarted && !g_hidppShortcuts.empty()) ? kHidppRetryMs : INFINITE;
+        DWORD waitResult = MsgWaitForMultipleObjects(waitHandleCount, waitHandles, FALSE, timeout, QS_ALLINPUT);
         if (waitResult == WAIT_OBJECT_0)
         {
             break;
+        }
+
+        if (g_hidppRestartEvent != NULL && waitResult == WAIT_OBJECT_0 + 1)
+        {
+            hidppStarted = RestartHidpp(configPath, true, "read_failure");
+            continue;
+        }
+
+        if (waitResult == WAIT_TIMEOUT)
+        {
+            hidppStarted = RestartHidpp(configPath, false, "retry");
+            continue;
+        }
+
+        if (waitResult == WAIT_FAILED)
+        {
+            AppendLog("message wait failed; error=" + std::to_string(GetLastError()));
+            Sleep(100);
+            continue;
         }
 
         while (PeekMessageW(&message, NULL, 0, 0, PM_REMOVE))
@@ -2150,6 +2261,11 @@ int RunMouseLogiNative(HINSTANCE instance)
     StopTray();
     StopHidpp();
     UnhookWindowsHookEx(g_hook);
+    if (g_hidppRestartEvent != NULL)
+    {
+        CloseHandle(g_hidppRestartEvent);
+        g_hidppRestartEvent = NULL;
+    }
     CloseHandle(quitEvent);
     CloseHandle(mutex);
     AppendLog("stopped");
