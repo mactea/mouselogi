@@ -2,6 +2,7 @@
 #include <windows.h>
 #include <setupapi.h>
 #include <shellapi.h>
+#include <psapi.h>
 #include <hidsdi.h>
 #include <hidpi.h>
 
@@ -50,9 +51,13 @@ namespace
     const DWORD kHidppRetryMs = 5000;
     const UINT kTrayIconId = 1;
     const UINT kTrayCallbackMessage = WM_APP + 1;
+    const UINT kTrayShowMenuMessage = WM_APP + 2;
     const UINT kTrayMenuOpenConfig = 1001;
     const UINT kTrayMenuReset = 1002;
     const UINT kTrayMenuExit = 1003;
+    const UINT_PTR kTrayRefreshTimer = 1004;
+    const UINT kTrayRefreshMs = 5000;
+    const DWORD kTrayMenuDebounceMs = 300;
 
     struct HidDevice
     {
@@ -90,6 +95,10 @@ namespace
     bool g_trayWarning = false;
     size_t g_trayMappingCount = 0;
     UINT g_taskbarCreatedMessage = 0;
+    bool g_trayMenuOpen = false;
+    bool g_trayMenuPending = false;
+    bool g_trayVersion4 = false;
+    DWORD g_lastTrayMenuClosedTick = 0;
 
     bool AddTrayIcon(HWND hwnd);
     void ShowTrayMenu(HWND hwnd);
@@ -880,7 +889,7 @@ namespace
         return count;
     }
 
-    std::wstring BuildTrayTooltip()
+    std::wstring BuildTrayStatusText()
     {
         if (g_trayEffective)
         {
@@ -893,6 +902,43 @@ namespace
         }
 
         return L"MouseLogi: no active shortcuts";
+    }
+
+    std::wstring FormatMemoryBytes(SIZE_T bytes)
+    {
+        double megabytes = static_cast<double>(bytes) / (1024.0 * 1024.0);
+        wchar_t buffer[32] = {};
+        if (megabytes < 100.0)
+        {
+            swprintf_s(buffer, L"%.1f MB", megabytes);
+        }
+        else
+        {
+            swprintf_s(buffer, L"%.0f MB", megabytes);
+        }
+        return buffer;
+    }
+
+    std::wstring GetCurrentMemoryText()
+    {
+        PROCESS_MEMORY_COUNTERS counters = {};
+        counters.cb = sizeof(counters);
+        if (!GetProcessMemoryInfo(GetCurrentProcess(), &counters, sizeof(counters)))
+        {
+            return L"unavailable";
+        }
+
+        return FormatMemoryBytes(counters.WorkingSetSize);
+    }
+
+    std::wstring BuildTrayMemoryText()
+    {
+        return L"Memory: " + GetCurrentMemoryText();
+    }
+
+    std::wstring BuildTrayTooltip()
+    {
+        return BuildTrayStatusText() + L" | " + BuildTrayMemoryText();
     }
 
     void FillTrayData(NOTIFYICONDATAW* data, HWND hwnd)
@@ -919,10 +965,12 @@ namespace
         std::wstring tooltip = BuildTrayTooltip();
         lstrcpynW(data.szTip, tooltip.c_str(), ARRAYSIZE(data.szTip));
 
+        bool addingIcon = !g_trayIconVisible;
         BOOL ok = Shell_NotifyIconW(g_trayIconVisible ? NIM_MODIFY : NIM_ADD, &data);
         if (!ok && g_trayIconVisible)
         {
             ok = Shell_NotifyIconW(NIM_ADD, &data);
+            addingIcon = true;
         }
 
         if (!ok)
@@ -931,9 +979,12 @@ namespace
             return false;
         }
 
-        data.uVersion = NOTIFYICON_VERSION_4;
-        Shell_NotifyIconW(NIM_SETVERSION, &data);
         g_trayIconVisible = true;
+        if (addingIcon)
+        {
+            data.uVersion = NOTIFYICON_VERSION_4;
+            g_trayVersion4 = Shell_NotifyIconW(NIM_SETVERSION, &data) != FALSE;
+        }
         return true;
     }
 
@@ -948,6 +999,7 @@ namespace
         FillTrayData(&data, g_trayWindow);
         Shell_NotifyIconW(NIM_DELETE, &data);
         g_trayIconVisible = false;
+        g_trayVersion4 = false;
     }
 
     void OpenConfigFile()
@@ -1013,16 +1065,52 @@ namespace
         AppendMenuW(menu, MF_STRING, kTrayMenuOpenConfig, L"Open config");
         AppendMenuW(menu, MF_STRING, kTrayMenuReset, L"Reload shortcuts");
         AppendMenuW(menu, MF_SEPARATOR, 0, NULL);
+        std::wstring memoryText = BuildTrayMemoryText();
+        AppendMenuW(menu, MF_STRING | MF_GRAYED, 0, memoryText.c_str());
+        AppendMenuW(menu, MF_SEPARATOR, 0, NULL);
         AppendMenuW(menu, MF_STRING, kTrayMenuExit, L"Exit");
 
+        SetWindowPos(hwnd, HWND_TOP, -32000, -32000, 1, 1, SWP_NOOWNERZORDER | SWP_SHOWWINDOW);
         SetForegroundWindow(hwnd);
-        UINT command = TrackPopupMenu(menu, TPM_RIGHTBUTTON | TPM_RETURNCMD | TPM_NONOTIFY, cursor.x, cursor.y, 0, hwnd, NULL);
+        g_trayMenuOpen = true;
+        UINT command = TrackPopupMenuEx(menu, TPM_RIGHTBUTTON | TPM_RETURNCMD, cursor.x, cursor.y, hwnd, NULL);
+        g_trayMenuOpen = false;
+        g_lastTrayMenuClosedTick = GetTickCount();
         DestroyMenu(menu);
+        ShowWindow(hwnd, SW_HIDE);
+        PostMessageW(hwnd, WM_NULL, 0, 0);
         if (command != 0)
         {
-            SendMessageW(hwnd, WM_COMMAND, command, 0);
+            PostMessageW(hwnd, WM_COMMAND, command, 0);
         }
-        PostMessageW(hwnd, WM_NULL, 0, 0);
+    }
+
+    bool IsTrayMenuRequest(LPARAM lParam)
+    {
+        UINT event = LOWORD(lParam);
+        if (event == WM_CONTEXTMENU)
+        {
+            return true;
+        }
+
+        return !g_trayVersion4 && event == WM_RBUTTONUP;
+    }
+
+    void RequestTrayMenu(HWND hwnd)
+    {
+        DWORD now = GetTickCount();
+        if (g_trayMenuOpen || g_trayMenuPending)
+        {
+            return;
+        }
+
+        if (g_lastTrayMenuClosedTick != 0 && now - g_lastTrayMenuClosedTick < kTrayMenuDebounceMs)
+        {
+            return;
+        }
+
+        g_trayMenuPending = true;
+        PostMessageW(hwnd, kTrayShowMenuMessage, 0, 0);
     }
 
     LRESULT CALLBACK TrayWindowProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lParam)
@@ -1037,10 +1125,15 @@ namespace
         switch (message)
         {
             case kTrayCallbackMessage:
-                if (LOWORD(lParam) == WM_CONTEXTMENU || LOWORD(lParam) == WM_RBUTTONUP)
+                if (IsTrayMenuRequest(lParam))
                 {
-                    ShowTrayMenu(hwnd);
+                    RequestTrayMenu(hwnd);
                 }
+                return 0;
+
+            case kTrayShowMenuMessage:
+                g_trayMenuPending = false;
+                ShowTrayMenu(hwnd);
                 return 0;
 
             case WM_COMMAND:
@@ -1057,6 +1150,17 @@ namespace
                         return 0;
                     default:
                         break;
+                }
+                break;
+
+            case WM_TIMER:
+                if (wParam == kTrayRefreshTimer)
+                {
+                    if (!g_trayMenuOpen && !g_trayMenuPending)
+                    {
+                        AddTrayIcon(hwnd);
+                    }
+                    return 0;
                 }
                 break;
 
@@ -1084,14 +1188,14 @@ namespace
         }
 
         HWND hwnd = CreateWindowExW(
-            0,
+            WS_EX_TOOLWINDOW,
             kTrayWindowClassName,
             L"MouseLogiNative",
-            WS_OVERLAPPED,
-            0,
-            0,
-            0,
-            0,
+            WS_POPUP,
+            -32000,
+            -32000,
+            1,
+            1,
             NULL,
             NULL,
             instance,
@@ -1136,11 +1240,21 @@ namespace
             return false;
         }
 
-        return AddTrayIcon(g_trayWindow);
+        bool added = AddTrayIcon(g_trayWindow);
+        if (added)
+        {
+            SetTimer(g_trayWindow, kTrayRefreshTimer, kTrayRefreshMs, NULL);
+        }
+        return added;
     }
 
     void StopTray()
     {
+        if (g_trayWindow != NULL)
+        {
+            KillTimer(g_trayWindow, kTrayRefreshTimer);
+        }
+
         RemoveTrayIcon();
 
         if (g_trayWindow != NULL)

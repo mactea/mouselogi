@@ -37,6 +37,8 @@ namespace MouseLogi
         private readonly NotifyIcon notifyIcon;
         private readonly MouseHook mouseHook;
         private readonly string configPath;
+        private readonly System.Windows.Forms.Timer memoryTimer;
+        private ToolStripMenuItem memoryMenuItem;
         private Dictionary<string, Shortcut> mappings = new Dictionary<string, Shortcut>(StringComparer.OrdinalIgnoreCase);
 
         public TrayAppContext()
@@ -46,9 +48,14 @@ namespace MouseLogi
 
             notifyIcon = new NotifyIcon();
             notifyIcon.Icon = SystemIcons.Application;
-            notifyIcon.Text = "MouseLogi";
             notifyIcon.Visible = true;
             notifyIcon.ContextMenuStrip = BuildMenu();
+            UpdateMemoryDisplay();
+
+            memoryTimer = new System.Windows.Forms.Timer();
+            memoryTimer.Interval = 5000;
+            memoryTimer.Tick += delegate { UpdateMemoryDisplay(); };
+            memoryTimer.Start();
 
             mouseHook = new MouseHook(HandleMouseTrigger);
             try
@@ -76,11 +83,17 @@ namespace MouseLogi
             ToolStripMenuItem openConfig = new ToolStripMenuItem("Open Config");
             openConfig.Click += delegate { OpenConfig(); };
 
+            memoryMenuItem = new ToolStripMenuItem();
+            memoryMenuItem.Enabled = false;
+            UpdateMemoryDisplay();
+
             ToolStripMenuItem exit = new ToolStripMenuItem("Exit");
             exit.Click += delegate { ExitThread(); };
 
             menu.Items.Add(reload);
             menu.Items.Add(openConfig);
+            menu.Items.Add(new ToolStripSeparator());
+            menu.Items.Add(memoryMenuItem);
             menu.Items.Add(new ToolStripSeparator());
             menu.Items.Add(exit);
             return menu;
@@ -109,6 +122,8 @@ namespace MouseLogi
 
             if (!quiet)
             {
+                UpdateMemoryDisplay();
+
                 string message = "Loaded " + mappings.Count + " mapping(s).";
                 if (result.Errors.Count > 0)
                 {
@@ -117,6 +132,57 @@ namespace MouseLogi
 
                 notifyIcon.ShowBalloonTip(2000, "MouseLogi", message, result.Errors.Count == 0 ? ToolTipIcon.Info : ToolTipIcon.Warning);
             }
+        }
+
+        private void UpdateMemoryDisplay()
+        {
+            string memoryText = GetCurrentMemoryText();
+            if (notifyIcon != null)
+            {
+                notifyIcon.Text = LimitNotifyIconText("MouseLogi | " + mappings.Count + " mapping(s) | Memory: " + memoryText);
+            }
+
+            if (memoryMenuItem != null)
+            {
+                memoryMenuItem.Text = "Memory: " + memoryText;
+            }
+        }
+
+        private static string GetCurrentMemoryText()
+        {
+            try
+            {
+                using (Process process = Process.GetCurrentProcess())
+                {
+                    return FormatMemoryBytes(process.WorkingSet64);
+                }
+            }
+            catch
+            {
+                return "unavailable";
+            }
+        }
+
+        private static string FormatMemoryBytes(long bytes)
+        {
+            double megabytes = bytes / (1024.0 * 1024.0);
+            return megabytes < 100.0 ? megabytes.ToString("0.0") + " MB" : megabytes.ToString("0") + " MB";
+        }
+
+        private static string LimitNotifyIconText(string text)
+        {
+            if (text.Length <= 63)
+            {
+                return text;
+            }
+
+            string memoryOnly = "MouseLogi | Memory: " + GetCurrentMemoryText();
+            if (memoryOnly.Length <= 63)
+            {
+                return memoryOnly;
+            }
+
+            return memoryOnly.Substring(0, 63);
         }
 
         private void OpenConfig()
@@ -136,6 +202,12 @@ namespace MouseLogi
 
         protected override void ExitThreadCore()
         {
+            if (memoryTimer != null)
+            {
+                memoryTimer.Stop();
+                memoryTimer.Dispose();
+            }
+
             if (mouseHook != null)
             {
                 mouseHook.Dispose();
